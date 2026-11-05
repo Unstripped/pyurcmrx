@@ -4,6 +4,8 @@ Home Assistant integration for URC Total Control MRX controllers, plus `pyurcmrx
 
 This is a clean-room implementation. Its only source is the public [open-control-spec](https://github.com/Unstripped/open-control-spec); it contains no vendor code, keys, or assets. Not affiliated with Universal Remote Control, Inc.
 
+Licensed under the [MIT License](LICENSE).
+
 ## Implemented
 
 | Area | Spec | API |
