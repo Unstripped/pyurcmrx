@@ -1,56 +1,82 @@
+import json
 import re
+from pathlib import Path
 
 import pytest
 
-from pyurcmrx import ProjectParseError, build_catalog, parse_mcs, parse_mcs_info
+from pyurcmrx import FunctionRef, ProjectParseError, decode_function_code, parse_core_model
 
-# Spec §30 §8.1 minimal project test vectors.
-MCS = (
-    '{"con_devs":[{"id":2,"name":"Living Room TV","db":{"type":0,"builtins":[],"zones":[{"idx":0,"funcs":'
-    '[{"id":530,"name":"Power"},{"id":275,"name":"Vol+"},{"id":276,"name":"Vol-"},{"id":277,"name":"Mute"}]}]}}],'
-    '"editor_ver":"CCP_BIN_VER_STR3.02.0628.4     ","editor_type":"URC Accelerator 2"}'
-)
-MCS_INFO = (
-    '{"bstations":[{"obj_id":1,"name":"Master MRX-15","model":"MRX-15"}],"clients":[{"obj_id":5,"name":"Mobile Client",'
-    '"model":"IPhoneV2"}],"devices":[{"obj_id":2,"name":"Living Room TV","model":"DBMODEL","db":{"type":"IR",'
-    '"category":"TV","brand":"Generic","model":"GENERIC_TV"}}],"editor_ver":"CCP_BIN_VER_STR3.02.0628.4     ",'
-    '"editor_type":"URC Accelerator 3","editor_name":"Accelerator 3 -","download_date":"2026-11-02 12:00:00",'
-    '"file_indicator":1730548800,"special_jump":[{"Please Wait":10},{"Off Site Option":3},{"Sleep Timer":3},'
-    '{"HDA Room EQ":1}]}'
-)
+FIXTURES = Path(__file__).parent / "fixtures"
 
 
-def test_minimal_project_catalog():
-    catalog = build_catalog(parse_mcs(MCS), parse_mcs_info(MCS_INFO.encode()))
-    assert len(catalog) == 1
-    entry = catalog[0]
-    assert (entry.device.id, entry.device.name, entry.device.multi_zone) == (2, "Living Room TV", False)
-    assert [(f.id, f.name) for f in entry.device.zones[0].funcs] == [(530, "Power"), (275, "Vol+"), (276, "Vol-"), (277, "Mute")]
-    assert (entry.info.model, entry.info.transport, entry.info.category, entry.info.brand) == ("DBMODEL", "IR", "TV", "Generic")
+@pytest.mark.parametrize("name", ["core_model_spec53.json", "core_model_spec30.json"])
+def test_spec_minimal_core_model(name):
+    model = parse_core_model((FIXTURES / name).read_bytes())
+    assert model.file_indicator == 1730548800
+    (room,) = model.rooms
+    assert (room.id, room.name) == (1, "Living Room")
+    (device,) = room.devices
+    assert (device.id, device.name, device.device_type) == (2, "Living Room TV", "DBMODEL")
+    assert [(b.label, b.page, b.functions) for b in device.buttons] == [
+        ("Vol+", None, (FunctionRef(2, 275),)),
+        ("Vol-", None, (FunctionRef(2, 276),)),
+        ("Mute", None, (FunctionRef(2, 277),)),
+        # Spec vector's Power slot decodes to device 3 / function 278 (kept as authored).
+        ("Power", None, (FunctionRef(3, 278),)),
+        ("CH +", "channel", (FunctionRef(2, 279),)),
+        ("CH -", "channel", (FunctionRef(2, 280),)),
+    ]
 
 
-def test_multi_zone_device_and_missing_info_entry():
-    mcs = (
-        '{"con_devs":[{"id":7,"name":"HDA","db":{"type":1,"builtins":[],"zones":['
-        '{"idx":0,"funcs":[{"id":275,"name":"Vol+"}]},{"idx":1,"funcs":[{"id":277,"name":"Mute"}]}]}}],'
-        '"editor_ver":"v","editor_type":"t"}'
-    )
-    info = MCS_INFO.replace('"obj_id":2', '"obj_id":3')
-    (entry,) = build_catalog(parse_mcs(mcs), parse_mcs_info(info))
-    assert entry.device.multi_zone
-    assert [z.idx for z in entry.device.zones] == [0, 1]
-    assert entry.info is None
+def test_decode_function_code_spec_example():
+    assert decode_function_code(131347) == FunctionRef(2, 275)
+    with pytest.raises(ValueError):
+        decode_function_code(1 << 32)
+
+
+def _model(device_obj: dict) -> str:
+    room = {"id": 4, "info": {"obj": {"name": "Den"}}, "devices": [{"obj": device_obj}]}
+    return json.dumps({"data": {"rooms": [room]}})
+
+
+def test_duplicate_and_hidden_buttons_are_dropped_and_multi_step_macros_kept():
+    device = {
+        "id": 9,
+        "name": "HDA",
+        "hard_btns": [{"hbtn_id": 275, "macro": [{"type": 33, "code": (9 << 16) | 275}]}],
+        "pages": [
+            {
+                "name": "audio",
+                "buttons": [
+                    {"name": "Louder", "macro": [{"type": 33, "code": (9 << 16) | 275}]},
+                    {"name": "Hidden", "hidden": 2, "macro": [{"type": 33, "code": (9 << 16) | 1}]},
+                    {"name": "Nav only", "macro": [{"type": 54, "room": 4}]},
+                    {"name": "", "macro": [{"type": 33, "code": (9 << 16) | 1001}, {"type": 33, "code": (9 << 16) | 277}]},
+                ],
+            }
+        ],
+    }
+    (room,) = parse_core_model(_model(device)).rooms
+    assert [(b.label, b.functions) for b in room.devices[0].buttons] == [
+        ("Vol+", (FunctionRef(9, 275),)),
+        ("Function 1001", (FunctionRef(9, 1001), FunctionRef(9, 277))),
+    ]
 
 
 @pytest.mark.parametrize(
     "doc, message",
     [
         ("not json", "invalid JSON"),
-        ("[]", "root is not an object"),
-        ('{"editor_ver":"v","editor_type":"t"}', "missing required field 'con_devs'"),
-        (MCS.replace('"id":2,', '"id":true,', 1), "con_devs[0].id: expected int"),
+        ("[]", "core_model.json: missing required field 'data'"),
+        ('{"data":{}}', "data: missing required field 'rooms'"),
+        (_model({"name": "x"}), "data.rooms[0].devices[0].obj: missing required field 'id'"),
+        (_model({"id": True, "name": "x"}), "data.rooms[0].devices[0].obj.id: expected int"),
+        (
+            _model({"id": 1, "name": "x", "hard_btns": [{"macro": [{"type": 33, "code": "5"}]}]}),
+            "hard_btns[0].macro[0].code: expected int",
+        ),
     ],
 )
-def test_invalid_mcs_reports_location(doc, message):
+def test_invalid_core_model_reports_location(doc, message):
     with pytest.raises(ProjectParseError, match=re.escape(message)):
-        parse_mcs(doc)
+        parse_core_model(doc)

@@ -7,10 +7,14 @@ import asyncio
 import sys
 from pathlib import Path
 
+import aiomqtt
+
 from .control import ControlClient
 from .discovery import discover
 from .errors import UrcMrxError
-from .project import build_catalog, parse_mcs, parse_mcs_info
+from .project import CoreModel, parse_core_model
+from .staging import fetch_core_model
+from .telemetry import OtherTelemetry, subscribe
 
 
 async def _discover(args: argparse.Namespace) -> None:
@@ -41,15 +45,38 @@ async def _macro(args: argparse.Namespace) -> None:
         print(f"accepted, queue handle {handle}")
 
 
+async def _volume(args: argparse.Namespace) -> None:
+    async with ControlClient(args.host) as client:
+        handle = await client.set_volume(args.device, args.level, mute=args.mute)
+        print(f"accepted, queue handle {handle}")
+
+
+def _print_catalog(model: CoreModel) -> None:
+    print(f"system: {model.system_name or '(unnamed)'}")
+    for room in model.rooms:
+        print(f"room {room.id}: {room.name}")
+        for device in room.devices:
+            print(f"  device {device.id}: {device.name} ({device.device_type or '?'})")
+            for button in device.buttons:
+                steps = ", ".join(f"device {f.device_id} function {f.func_id}" for f in button.functions)
+                page = f" [{button.page}]" if button.page else ""
+                print(f"    {button.label}{page}: {steps}")
+
+
 async def _catalog(args: argparse.Namespace) -> None:
-    catalog = build_catalog(parse_mcs(args.mcs.read_bytes()), parse_mcs_info(args.mcs_info.read_bytes()))
-    for entry in catalog:
-        d, info = entry.device, entry.info
-        kind = "multi-zone" if d.multi_zone else "single-zone"
-        detail = f"{info.model} {info.transport or ''} {info.category or ''}".strip() if info else "not in mcs_info.dat"
-        print(f"device {d.id}: {d.name} ({kind}; {detail})")
-        for zone in d.zones:
-            print(f"  zone {zone.idx}: " + ", ".join(f"{f.id}={f.name}" for f in zone.funcs))
+    if args.file is not None:
+        _print_catalog(parse_core_model(args.file.read_bytes()))
+    elif args.host is not None:
+        _print_catalog(await fetch_core_model(args.host))
+    else:
+        raise SystemExit("catalog needs HOST or --file")
+
+
+async def _watch(args: argparse.Namespace) -> None:
+    async for telemetry in subscribe(args.host):
+        event = telemetry.event
+        detail = event.body if isinstance(event, OtherTelemetry) else event
+        print(f"{telemetry.topic}\t{detail}", flush=True)
 
 
 def main() -> None:
@@ -60,7 +87,7 @@ def main() -> None:
     p.add_argument("--timeout", type=float, default=2.0)
     p.set_defaults(run=_discover)
 
-    p = sub.add_parser("status", help="query network status and project file time")
+    p = sub.add_parser("status", help="query network status and project identity")
     p.add_argument("host")
     p.set_defaults(run=_status)
 
@@ -76,15 +103,28 @@ def main() -> None:
     p.add_argument("--flags", type=int, default=0, help="0 single, 1 press, 2 release, 3 hold")
     p.set_defaults(run=_macro)
 
-    p = sub.add_parser("catalog", help="print the device catalog from local mcs.dat + mcs_info.dat")
-    p.add_argument("mcs", type=Path)
-    p.add_argument("mcs_info", type=Path)
+    p = sub.add_parser("volume", help="set absolute volume with 0x07ED")
+    p.add_argument("host")
+    p.add_argument("device", type=int)
+    p.add_argument("level", type=int, help="0..100")
+    p.add_argument("--mute", action="store_true")
+    p.set_defaults(run=_volume)
+
+    p = sub.add_parser("catalog", help="print rooms, devices and buttons from core_model.json")
+    p.add_argument("host", nargs="?", help="fetch from the controller over anonymous FTP")
+    p.add_argument("--file", type=Path, help="read a local core_model.json instead")
     p.set_defaults(run=_catalog)
+
+    p = sub.add_parser("watch", help="stream MQTT state telemetry")
+    p.add_argument("host")
+    p.set_defaults(run=_watch)
 
     args = parser.parse_args()
     try:
         asyncio.run(args.run(args))
-    except (UrcMrxError, OSError, TimeoutError) as err:
+    except KeyboardInterrupt:
+        pass
+    except (UrcMrxError, OSError, TimeoutError, ValueError, aiomqtt.MqttError) as err:
         print(f"error: {err!r}", file=sys.stderr)
         sys.exit(1)
 

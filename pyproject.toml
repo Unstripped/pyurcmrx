@@ -4,13 +4,13 @@ version = "0.1.0"
 description = "Async LAN client for URC Total Control MRX controllers (clean-room, built from open-control-spec)"
 readme = "README.md"
 requires-python = ">=3.13"
-dependencies = []
+dependencies = ["aiomqtt>=2.5"]
 
 [project.scripts]
 pyurcmrx = "pyurcmrx.__main__:main"
 
 [dependency-groups]
-dev = ["pytest>=8", "pytest-asyncio>=1.0"]
+dev = ["pytest>=8", "pytest-asyncio>=1.0", "pyftpdlib>=2.0"]
 
 [build-system]
 requires = ["hatchling"]

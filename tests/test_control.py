@@ -185,3 +185,17 @@ async def test_flags_are_encoded_in_macro_action(serve):
     async with ControlClient("127.0.0.1", await serve(fake)) as client:
         await client.macro_action(0, 7, 275, ActionFlags.HOLD)
     assert fake.requests == [bytes.fromhex("021200da07" "00000000" "07000000" "13010000" "03000000")]
+
+
+async def test_set_volume_matches_spec_vector(serve):
+    fake = FakeController({0x07ED: MACRO_RESP})
+    async with ControlClient("127.0.0.1", await serve(fake)) as client:
+        assert await client.set_volume(2, 45) == 0x0201
+    # Spec §52 §5.3 request vector, verbatim.
+    assert fake.requests == [bytes.fromhex("02 15 00 ed 07 13 01 02 00 00 00 00 00 64 00 00 00 2d 00 00 00 00 00 00")]
+
+
+@pytest.mark.parametrize("kwargs", [{"level": 101}, {"level": 50, "max_value": 40}, {"level": 5, "min_value": 10}])
+async def test_set_volume_rejects_out_of_range(kwargs):
+    with pytest.raises(ValueError):
+        await ControlClient("127.0.0.1").set_volume(2, **kwargs)

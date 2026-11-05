@@ -30,6 +30,7 @@ class Opcode(IntEnum):
     ROOMS_CMD_ROOM_POWER_ON = 0x0012
     MACRO_ACTION = 0x07DA
     ACTION_ACK = 0x07DB
+    ACTION_AVR_SET_DRAG_VOLUME = 0x07ED
     VARIABLE_TABLE = 0x0898
     VARIABLE_CMD_GET_TABLE = 0x089A
     GET_NET_STATUS = 0x0FE1
@@ -254,6 +255,28 @@ class ControlClient:
         `macro_id` is a room macro ID or trigger code.
         """
         return await self._action(Opcode.MACRO_ACTION, struct.pack("<IIII", room_id, device_id, macro_id, flags))
+
+    async def set_volume(
+        self,
+        device_id: int,
+        level: int,
+        *,
+        button_id: int = 275,
+        min_value: int = 0,
+        max_value: int = 100,
+        mute: bool = False,
+    ) -> int:
+        """Set an absolute volume (0..100) and mute state (spec §52 §3.2, `0x07ED`).
+
+        The target is `trigger_code = (device_id << 16) | button_id`; the spec vector uses
+        the device's Vol+ function (275) as `button_id`.
+        """
+        if not 0 <= device_id <= 0xFFFF or not 0 <= button_id <= 0xFFFF:
+            raise ValueError("device_id and button_id must fit in 16 bits")
+        if not 0 <= min_value <= level <= max_value <= 100:
+            raise ValueError(f"need 0 <= min_value <= level <= max_value <= 100, got {min_value}, {level}, {max_value}")
+        payload = struct.pack("<IIIIBH", (device_id << 16) | button_id, min_value, max_value, level, int(mute), 0)
+        return await self._action(Opcode.ACTION_AVR_SET_DRAG_VOLUME, payload)
 
     async def room_power_on(self, room_id: int) -> int:
         return await self._action(Opcode.ROOMS_CMD_ROOM_POWER_ON, struct.pack("<I", room_id))

@@ -9,19 +9,22 @@ This is a clean-room implementation. Its only source is the public [open-control
 | Area | Spec | API |
 |---|---|---|
 | Discovery (UDP 61510) | §50 | `discover()`, `build_probe()`, `parse_find_ack()` |
-| Runtime control (TCP 51510) | §52 | `ControlClient`: `get_net_status`, `get_file_time`, `get_variables`, `macro_action`, `room_power_on/off`, `house_off` |
-| Project catalog | §30 | `parse_mcs()`, `parse_mcs_info()`, `build_catalog()` |
+| Project catalog (anonymous FTP, `core_model.json`) | §53 §3.4, §30 §1.1, §20 §3 | `fetch_core_model()`, `parse_core_model()`: rooms, devices, buttons with decoded `(device_id, func_id)` steps |
+| Control (TCP 51510) | §52 | `ControlClient`: `macro_action` (with press/hold/release flags), `set_volume` (`0x07ED`), `room_power_on/off`, `house_off`, `get_variables`, `get_net_status`, `get_file_time` (project token for change detection); automatic keepalive |
+| State telemetry (MQTT 1883) | §00 §5.2 | `subscribe()`, `parse_telemetry()`: room zone status, HDA zone status, variables, room links |
 
-Not implemented until the spec defines it: reading the project catalog from a running controller, state feedback (MQTT/UDP), relays, sensors, RS-232, and HDA zone state.
+Relays, sensors and RS-232 ports cannot be driven directly from the LAN; they are reachable only through the dealer-programmed buttons and macros listed in the catalog.
 
 ## CLI
 
 ```
 pyurcmrx discover
+pyurcmrx catalog 192.168.1.100          # or: pyurcmrx catalog --file core_model.json
 pyurcmrx status 192.168.1.100
 pyurcmrx variables 192.168.1.100
-pyurcmrx macro 192.168.1.100 ROOM DEVICE MACRO [--flags N]
-pyurcmrx catalog mcs.dat mcs_info.dat
+pyurcmrx macro 192.168.1.100 ROOM DEVICE FUNCTION [--flags 0|1|2|3]
+pyurcmrx volume 192.168.1.100 DEVICE LEVEL [--mute]
+pyurcmrx watch 192.168.1.100
 ```
 
 ## Development
@@ -31,3 +34,5 @@ mise install
 uv sync
 uv run pytest
 ```
+
+The MQTT subscriber test runs against a local `mosquitto` and is skipped when it is not installed.

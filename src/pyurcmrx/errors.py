@@ -18,4 +18,12 @@ class ActionRejectedError(UrcMrxError):
 
 
 class ProjectParseError(UrcMrxError):
-    """A project file (mcs.dat / mcs_info.dat) is not valid per spec §30."""
+    """`core_model.json` is not valid per spec §53 §3.4."""
+
+
+class CatalogUnavailableError(UrcMrxError):
+    """The staged `core_model.json` could not be found, fetched, or verified."""
+
+
+class TelemetryParseError(UrcMrxError):
+    """An MQTT telemetry message does not match spec §00 §5.2."""

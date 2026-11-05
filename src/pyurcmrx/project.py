@@ -1,9 +1,8 @@
-"""Parsers for the controller's project catalog files (spec §30).
+"""Project catalog from `core_model.json` (spec §53 §3.4, §30 §1.1).
 
-`mcs.dat` lists controllable devices with per-zone function IDs; `mcs_info.dat` lists
-base stations, client seats, and device classification. `build_catalog` joins them by
-device ID. How a client obtains these files from a running controller is not yet
-specified (investigator question Q-001).
+`core_model.json` is the only project description a credential-free LAN client can read
+(anonymous FTP, `updateroot/`). It lists rooms, the devices assigned to each room, and
+UI buttons whose macros name device functions as `code = (device_id << 16) | func_id`.
 """
 
 from __future__ import annotations
@@ -14,182 +13,140 @@ from typing import Any
 
 from .errors import ProjectParseError
 
-DB_TYPE_STANDARD = 0
-DB_TYPE_MULTI_ZONE = 1
+STEP_DEVICE_FUNCTION = 33  # {"type": 33, "code": (device_id << 16) | func_id}
+STEP_ROOM_JUMP = 54  # {"type": 54, "room": room_id}: UI navigation only
+
+# Unlabelled mobile hard-button slots (spec §53 §3.4.6).
+HARD_BUTTON_LABELS = {275: "Vol+", 276: "Vol-", 277: "Mute", 4624: "Power"}
 
 
 @dataclass(frozen=True, slots=True)
-class Function:
-    id: int
+class FunctionRef:
+    device_id: int
+    func_id: int
+
+
+@dataclass(frozen=True, slots=True)
+class Button:
+    label: str
+    hbtn_id: int | None
+    page: str | None  # page name for page buttons, None for hard buttons
+    functions: tuple[FunctionRef, ...]  # type-33 steps in macro order
+
+
+@dataclass(frozen=True, slots=True)
+class Device:
+    id: int  # equals mcs.dat con_devs[].id and the MQTT hda/zone {device_id}
     name: str
+    model_name: str | None
+    device_type: str | None
+    buttons: tuple[Button, ...]
 
 
 @dataclass(frozen=True, slots=True)
-class Zone:
-    idx: int
-    funcs: tuple[Function, ...]
-
-
-@dataclass(frozen=True, slots=True)
-class ConnectedDevice:
-    id: int
+class Room:
+    id: int  # room_id for TCP 51510 and MQTT zone_status
     name: str
-    db_type: int
-    zones: tuple[Zone, ...]
-
-    @property
-    def multi_zone(self) -> bool:
-        return self.db_type == DB_TYPE_MULTI_ZONE
+    devices: tuple[Device, ...]
 
 
 @dataclass(frozen=True, slots=True)
-class DeviceModel:
-    """Parsed `mcs.dat`."""
-
-    devices: tuple[ConnectedDevice, ...]
-    editor_ver: str
-    editor_type: str
+class CoreModel:
+    system_name: str | None
+    file_indicator: int | None
+    rooms: tuple[Room, ...]
 
 
-@dataclass(frozen=True, slots=True)
-class Station:
-    obj_id: int
-    name: str
-    model: str
+def decode_function_code(code: int) -> FunctionRef:
+    if not 0 <= code <= 0xFFFFFFFF:
+        raise ValueError(f"function code out of uint32 range: {code}")
+    return FunctionRef(code >> 16, code & 0xFFFF)
 
 
-@dataclass(frozen=True, slots=True)
-class DeviceInfo:
-    obj_id: int
-    name: str
-    model: str
-    transport: str | None
-    category: str | None
-    brand: str | None
-    db_model: str | None
-    twoway_vfd: str | None
-
-
-@dataclass(frozen=True, slots=True)
-class SystemInfo:
-    """Parsed `mcs_info.dat`."""
-
-    base_stations: tuple[Station, ...]
-    clients: tuple[Station, ...]
-    devices: tuple[DeviceInfo, ...]
-    editor_ver: str
-    editor_type: str
-    download_date: str
-    file_indicator: int
-
-
-@dataclass(frozen=True, slots=True)
-class CatalogDevice:
-    """One controllable device: `mcs.dat` functions joined with `mcs_info.dat` metadata."""
-
-    device: ConnectedDevice
-    info: DeviceInfo | None  # None when the ID is missing from mcs_info.dat (spec §30 §7.4)
-
-
-def _load(data: bytes | str, filename: str) -> dict[str, Any]:
-    try:
-        root = json.loads(data)
-    except (json.JSONDecodeError, UnicodeDecodeError) as err:
-        raise ProjectParseError(f"{filename}: invalid JSON: {err}") from err
-    if not isinstance(root, dict):
-        raise ProjectParseError(f"{filename}: root is not an object")
-    return root
-
-
-def _field(obj: Any, key: str, kind: type | tuple[type, ...], where: str) -> Any:
+def _field(obj: Any, key: str, kind: type, where: str) -> Any:
     if not isinstance(obj, dict) or key not in obj:
         raise ProjectParseError(f"{where}: missing required field {key!r}")
     value = obj[key]
     # bool is an int subclass; reject it where an integer is required.
     if not isinstance(value, kind) or (kind is int and isinstance(value, bool)):
-        raise ProjectParseError(f"{where}.{key}: expected {getattr(kind, '__name__', kind)}, got {type(value).__name__}")
+        raise ProjectParseError(f"{where}.{key}: expected {kind.__name__}, got {type(value).__name__}")
     return value
 
 
-def _optional_str(obj: dict[str, Any] | None, key: str) -> str | None:
-    if obj is None:
+def _optional(obj: Any, key: str, kind: type) -> Any:
+    value = obj.get(key) if isinstance(obj, dict) else None
+    if isinstance(value, kind) and not (kind is int and isinstance(value, bool)):
+        return value
+    return None
+
+
+def _button(raw: Any, page: str | None, where: str) -> Button | None:
+    """Return the button, or None when it is hidden or triggers no device function."""
+    if not isinstance(raw, dict) or raw.get("hidden"):
         return None
-    value = obj.get(key)
-    return value if isinstance(value, str) else None
+    functions = []
+    for k, step in enumerate(raw.get("macro") or []):
+        if isinstance(step, dict) and step.get("type") == STEP_DEVICE_FUNCTION:
+            code = _field(step, "code", int, f"{where}.macro[{k}]")
+            try:
+                functions.append(decode_function_code(code))
+            except ValueError as err:
+                raise ProjectParseError(f"{where}.macro[{k}].code: {err}") from err
+    if not functions:
+        return None
+    hbtn_id = _optional(raw, "hbtn_id", int)
+    name = (_optional(raw, "name", str) or "").strip()
+    label = name or HARD_BUTTON_LABELS.get(hbtn_id) or f"Function {functions[0].func_id}"
+    return Button(label, hbtn_id, page, tuple(functions))
 
 
-def parse_mcs(data: bytes | str) -> DeviceModel:
-    root = _load(data, "mcs.dat")
-    devices = []
-    for i, raw in enumerate(_field(root, "con_devs", list, "mcs.dat")):
-        where = f"mcs.dat.con_devs[{i}]"
-        db = _field(raw, "db", dict, where)
-        zones = []
-        for j, raw_zone in enumerate(_field(db, "zones", list, f"{where}.db")):
-            zwhere = f"{where}.db.zones[{j}]"
-            funcs = tuple(
-                Function(_field(f, "id", int, f"{zwhere}.funcs[{k}]"), _field(f, "name", str, f"{zwhere}.funcs[{k}]"))
-                for k, f in enumerate(_field(raw_zone, "funcs", list, zwhere))
-            )
-            zones.append(Zone(_field(raw_zone, "idx", int, zwhere), funcs))
-        devices.append(
-            ConnectedDevice(
-                id=_field(raw, "id", int, where),
-                name=_field(raw, "name", str, where),
-                db_type=_field(db, "type", int, f"{where}.db"),
-                zones=tuple(zones),
-            )
-        )
-    return DeviceModel(
-        devices=tuple(devices),
-        editor_ver=_field(root, "editor_ver", str, "mcs.dat"),
-        editor_type=_field(root, "editor_type", str, "mcs.dat"),
+def _device(raw: Any, where: str) -> Device:
+    obj = _field(raw, "obj", dict, where)
+    where = f"{where}.obj"
+    candidates = [
+        _button(b, None, f"{where}.hard_btns[{i}]") for i, b in enumerate(_optional(obj, "hard_btns", list) or [])
+    ]
+    for p, page in enumerate(_optional(obj, "pages", list) or []):
+        page_name = _optional(page, "name", str)
+        for i, b in enumerate(_optional(page, "buttons", list) or []):
+            candidates.append(_button(b, page_name, f"{where}.pages[{p}].buttons[{i}]"))
+    # The same function often appears as a hard button and on a page; keep the first.
+    buttons: dict[tuple[FunctionRef, ...], Button] = {}
+    for button in candidates:
+        if button is not None:
+            buttons.setdefault(button.functions, button)
+    return Device(
+        id=_field(obj, "id", int, where),
+        name=_field(obj, "name", str, where),
+        model_name=_optional(obj, "model_name", str),
+        device_type=_optional(obj, "device_type", str),
+        buttons=tuple(buttons.values()),
     )
 
 
-def _stations(root: dict[str, Any], key: str) -> tuple[Station, ...]:
-    return tuple(
-        Station(
-            obj_id=_field(raw, "obj_id", int, f"mcs_info.dat.{key}[{i}]"),
-            name=_field(raw, "name", str, f"mcs_info.dat.{key}[{i}]"),
-            model=_field(raw, "model", str, f"mcs_info.dat.{key}[{i}]"),
-        )
-        for i, raw in enumerate(_field(root, key, list, "mcs_info.dat"))
-    )
-
-
-def parse_mcs_info(data: bytes | str) -> SystemInfo:
-    root = _load(data, "mcs_info.dat")
-    devices = []
-    for i, raw in enumerate(_field(root, "devices", list, "mcs_info.dat")):
-        where = f"mcs_info.dat.devices[{i}]"
-        db = raw.get("db") if isinstance(raw, dict) else None
-        db = db if isinstance(db, dict) else None
-        twoway = raw.get("twoway") if isinstance(raw, dict) else None
-        twoway = twoway if isinstance(twoway, dict) else None
-        devices.append(
-            DeviceInfo(
-                obj_id=_field(raw, "obj_id", int, where),
-                name=_field(raw, "name", str, where),
-                model=_field(raw, "model", str, where),
-                transport=_optional_str(db, "type"),
-                category=_optional_str(db, "category"),
-                brand=_optional_str(db, "brand"),
-                db_model=_optional_str(db, "model"),
-                twoway_vfd=_optional_str(twoway, "vfd"),
+def parse_core_model(data: bytes | str) -> CoreModel:
+    try:
+        root = json.loads(data)
+    except (json.JSONDecodeError, UnicodeDecodeError) as err:
+        raise ProjectParseError(f"core_model.json: invalid JSON: {err}") from err
+    body = _field(root, "data", dict, "core_model.json")
+    rooms = []
+    for r, raw_room in enumerate(_field(body, "rooms", list, "data")):
+        where = f"data.rooms[{r}]"
+        info = _field(_field(raw_room, "info", dict, where), "obj", dict, f"{where}.info")
+        rooms.append(
+            Room(
+                id=_field(raw_room, "id", int, where),
+                name=_field(info, "name", str, f"{where}.info.obj"),
+                devices=tuple(
+                    _device(d, f"{where}.devices[{i}]")
+                    for i, d in enumerate(_field(raw_room, "devices", list, where))
+                ),
             )
         )
-    return SystemInfo(
-        base_stations=_stations(root, "bstations"),
-        clients=_stations(root, "clients"),
-        devices=tuple(devices),
-        editor_ver=_field(root, "editor_ver", str, "mcs_info.dat"),
-        editor_type=_field(root, "editor_type", str, "mcs_info.dat"),
-        download_date=_field(root, "download_date", str, "mcs_info.dat"),
-        file_indicator=_field(root, "file_indicator", int, "mcs_info.dat"),
+    config = _optional(_optional(body, "config", dict), "obj", dict)
+    return CoreModel(
+        system_name=_optional(config, "system_name", str),
+        file_indicator=_optional(config, "file_indicator", int),
+        rooms=tuple(rooms),
     )
-
-
-def build_catalog(model: DeviceModel, info: SystemInfo) -> tuple[CatalogDevice, ...]:
-    by_id = {d.obj_id: d for d in info.devices}
-    return tuple(CatalogDevice(device, by_id.get(device.id)) for device in model.devices)
