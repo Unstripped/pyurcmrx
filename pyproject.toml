@@ -1,0 +1,22 @@
+[project]
+name = "pyurcmrx"
+version = "0.1.0"
+description = "Async LAN client for URC Total Control MRX controllers (clean-room, built from open-control-spec)"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = []
+
+[project.scripts]
+pyurcmrx = "pyurcmrx.__main__:main"
+
+[dependency-groups]
+dev = ["pytest>=8", "pytest-asyncio>=1.0"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+asyncio_default_fixture_loop_scope = "function"
