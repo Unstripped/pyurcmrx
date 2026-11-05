@@ -11,6 +11,11 @@ dependencies = ["aiomqtt>=2.5"]
 [project.scripts]
 pyurcmrx = "pyurcmrx.__main__:main"
 
+[project.urls]
+Source = "https://github.com/Unstripped/pyurcmrx"
+Issues = "https://github.com/Unstripped/pyurcmrx/issues"
+Specification = "https://github.com/Unstripped/open-control-spec"
+
 [dependency-groups]
 dev = ["pytest>=8", "pytest-asyncio>=1.0", "pyftpdlib>=2.0"]
 

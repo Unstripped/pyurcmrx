@@ -1,6 +1,6 @@
-# open-control-ha
+# pyurcmrx
 
-Home Assistant integration for URC Total Control MRX controllers, plus `pyurcmrx`, the async Python library it is built on. The library lives in `src/pyurcmrx/` and is published to PyPI; the integration will live in `custom_components/urc_mrx/` (HACS layout). Both are versioned together.
+Async Python client for URC Total Control MRX controllers on the local network. It powers the Home Assistant integration [open-control-ha](https://github.com/Unstripped/open-control-ha) but has no Home Assistant dependency.
 
 This is a clean-room implementation. Its only source is the public [open-control-spec](https://github.com/Unstripped/open-control-spec); it contains no vendor code, keys, or assets. Not affiliated with Universal Remote Control, Inc.
 
