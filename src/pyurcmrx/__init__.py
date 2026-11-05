@@ -3,7 +3,16 @@
 Clean-room implementation of https://github.com/Unstripped/open-control-spec.
 """
 
-from .control import CONTROL_PORT, ControlClient, Opcode, Response, ResponseDecoder, encode_request
+from .control import (
+    CONTROL_PORT,
+    ActionFlags,
+    ControlClient,
+    Opcode,
+    ProjectIdentity,
+    Response,
+    ResponseDecoder,
+    encode_request,
+)
 from .discovery import DISCOVERY_PORT, DiscoveredController, build_probe, discover, parse_find_ack
 from .errors import ActionRejectedError, MalformedFrameError, ProjectParseError, ProtocolError, UrcMrxError
 from .project import (
@@ -23,6 +32,7 @@ from .project import (
 __all__ = [
     "CONTROL_PORT",
     "DISCOVERY_PORT",
+    "ActionFlags",
     "ActionRejectedError",
     "CatalogDevice",
     "ConnectedDevice",
@@ -36,7 +46,8 @@ __all__ = [
     "ProjectParseError",
     "ProtocolError",
     "Response",
-    "ResponseDecoder",
+    "ProjectIdentity",
+    "ProjectParseError",
     "Station",
     "SystemInfo",
     "UrcMrxError",

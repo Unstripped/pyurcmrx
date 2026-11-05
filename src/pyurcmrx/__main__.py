@@ -24,7 +24,9 @@ async def _discover(args: argparse.Namespace) -> None:
 async def _status(args: argparse.Namespace) -> None:
     async with ControlClient(args.host) as client:
         print(f"online: {await client.get_net_status()}")
-        print(f"project file time: {await client.get_file_time()}")
+        identity = await client.get_file_time()
+        print(f"controller time: {identity.timestamp}")
+        print(f"project token: {identity.project_token.hex()}")
 
 
 async def _variables(args: argparse.Namespace) -> None:
@@ -68,10 +70,10 @@ def main() -> None:
 
     p = sub.add_parser("macro", help="send MACRO_ACTION")
     p.add_argument("host")
-    p.add_argument("room", type=int)
-    p.add_argument("device", type=int)
-    p.add_argument("macro", type=int)
-    p.add_argument("--flags", type=int, default=0)
+    p.add_argument("room", type=int, help="room ID, or 0 to let the controller resolve a device's room")
+    p.add_argument("device", type=int, help="device ID, or 0 for a room/house macro")
+    p.add_argument("macro", type=int, help="device function ID, or room macro ID / trigger code")
+    p.add_argument("--flags", type=int, default=0, help="0 single, 1 press, 2 release, 3 hold")
     p.set_defaults(run=_macro)
 
     p = sub.add_parser("catalog", help="print the device catalog from local mcs.dat + mcs_info.dat")

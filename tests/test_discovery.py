@@ -11,7 +11,7 @@ def make_ack(seq: int = 1, mac: bytes = bytes.fromhex("001FB8001122")) -> bytes:
     return (
         bytes([seq])
         + bytes.fromhex("C353")
-        + (0x8000).to_bytes(2, "little")
+        + (0x8008).to_bytes(2, "little")
         + bytes(4)
         + mac
         + IPv4Address("192.168.1.100").packed
@@ -33,7 +33,7 @@ def test_probe_with_requester_ip_is_nine_bytes():
 
 def test_parse_ack_fields():
     c = parse_find_ack(make_ack())
-    assert (c.seq, c.model_id, c.mac) == (1, 0x8000, "00:1F:B8:00:11:22")
+    assert (c.seq, c.model_id, c.mac) == (1, 0x8008, "00:1F:B8:00:11:22")
     assert (c.ip, c.netmask, c.gateway) == (IPv4Address("192.168.1.100"), IPv4Address("255.255.255.0"), IPv4Address("192.168.1.1"))
     assert (c.model_name, c.description) == ("MRX-15", "MRX-15 Master")
 

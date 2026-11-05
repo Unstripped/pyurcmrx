@@ -3,10 +3,12 @@ import asyncio
 import pytest
 
 from pyurcmrx import (
+    ActionFlags,
     ActionRejectedError,
     ControlClient,
     MalformedFrameError,
     Opcode,
+    ProjectIdentity,
     ProtocolError,
     ResponseDecoder,
     encode_request,
@@ -138,9 +140,48 @@ async def test_cancelled_request_reply_cannot_answer_next_request(serve):
 
 
 async def test_unexpected_opcode_drops_session(serve):
-    fake = FakeController({0x0FE1: MACRO_RESP, 0x0FE5: bytes.fromhex("000700fdff01") + (7).to_bytes(4, "little")})
+    fake = FakeController({0x0FE1: MACRO_RESP, 0x0FE6: file_time_reply(7, bytes(range(32)))})
     async with ControlClient("127.0.0.1", await serve(fake)) as client:
         with pytest.raises(ProtocolError):
             await client.get_net_status()
-        assert await client.get_file_time() == 7
+        assert await client.get_file_time() == ProjectIdentity(7, bytes(range(32)))
     assert fake.connections == 2
+
+
+def file_time_reply(timestamp: int, token: bytes, trailing: bytes = b"") -> bytes:
+    body = timestamp.to_bytes(4, "little") + token + trailing
+    return b"\x00" + (3 + len(body)).to_bytes(2, "little") + (0xFFFD).to_bytes(2, "little") + b"\x01" + body
+
+
+@pytest.mark.parametrize("trailing", [b"", bytes(12)], ids=["resp_length_39", "resp_length_51"])
+async def test_file_time_reads_timestamp_and_project_token(serve, trailing):
+    token = bytes.fromhex("ab" * 32)
+    fake = FakeController({0x0FE6: file_time_reply(1730548800, token, trailing)})
+    async with ControlClient("127.0.0.1", await serve(fake)) as client:
+        assert await client.get_file_time() == ProjectIdentity(1730548800, token)
+    assert fake.requests == [bytes.fromhex("020200e60f")]
+
+
+async def test_short_file_time_body_is_malformed(serve):
+    fake = FakeController({0x0FE6: file_time_reply(1, bytes(31))})
+    async with ControlClient("127.0.0.1", await serve(fake)) as client:
+        with pytest.raises(MalformedFrameError):
+            await client.get_file_time()
+
+
+async def test_keepalive_holds_idle_session_open(serve):
+    fake = FakeController({0x0FE1: NET_STATUS_RESP, 0x000E: MACRO_RESP})
+    async with ControlClient("127.0.0.1", await serve(fake), keepalive=0.05) as client:
+        await client.house_off()
+        await asyncio.sleep(0.18)
+        assert await client.house_off() == 0x0201
+    probes = fake.requests.count(NET_STATUS_REQ)
+    assert 2 <= probes <= 4
+    assert fake.connections == 1
+
+
+async def test_flags_are_encoded_in_macro_action(serve):
+    fake = FakeController({0x07DA: MACRO_RESP})
+    async with ControlClient("127.0.0.1", await serve(fake)) as client:
+        await client.macro_action(0, 7, 275, ActionFlags.HOLD)
+    assert fake.requests == [bytes.fromhex("021200da07" "00000000" "07000000" "13010000" "03000000")]
