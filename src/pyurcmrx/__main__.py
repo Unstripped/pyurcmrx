@@ -12,7 +12,7 @@ import aiomqtt
 from .control import ControlClient
 from .discovery import discover
 from .errors import UrcMrxError
-from .project import CoreModel, parse_core_model
+from .project import CoreModel, FunctionRef, parse_core_model
 from .staging import fetch_core_model
 from .telemetry import OtherTelemetry, subscribe
 
@@ -58,9 +58,13 @@ def _print_catalog(model: CoreModel) -> None:
         for device in room.devices:
             print(f"  device {device.id}: {device.name} ({device.device_type or '?'})")
             for button in device.buttons:
-                steps = ", ".join(f"device {f.device_id} function {f.func_id}" for f in button.functions)
+                steps = ", ".join(
+                    f"device {s.device_id} function {s.func_id}" if isinstance(s, FunctionRef) else f"unsupported {s.data}"
+                    for s in button.steps
+                )
                 page = f" [{button.page}]" if button.page else ""
-                print(f"    {button.label}{page}: {steps}")
+                runnable = "" if button.executable else " (not executable)"
+                print(f"    {button.label}{page}{runnable}: {steps}")
 
 
 async def _catalog(args: argparse.Namespace) -> None:

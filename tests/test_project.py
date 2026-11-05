@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from pyurcmrx import FunctionRef, ProjectParseError, decode_function_code, parse_core_model
+from pyurcmrx import FunctionRef, ProjectParseError, UnsupportedStep, decode_function_code, parse_core_model
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -17,7 +17,8 @@ def test_spec_minimal_core_model(name):
     assert (room.id, room.name) == (1, "Living Room")
     (device,) = room.devices
     assert (device.id, device.name, device.device_type) == (2, "Living Room TV", "DBMODEL")
-    assert [(b.label, b.page, b.functions) for b in device.buttons] == [
+    assert all(b.executable for b in device.buttons)
+    assert [(b.label, b.page, b.steps) for b in device.buttons] == [
         ("Vol+", None, (FunctionRef(2, 275),)),
         ("Vol-", None, (FunctionRef(2, 276),)),
         ("Mute", None, (FunctionRef(2, 277),)),
@@ -57,10 +58,37 @@ def test_duplicate_and_hidden_buttons_are_dropped_and_multi_step_macros_kept():
         ],
     }
     (room,) = parse_core_model(_model(device)).rooms
-    assert [(b.label, b.functions) for b in room.devices[0].buttons] == [
+    assert [(b.label, b.steps) for b in room.devices[0].buttons] == [
         ("Vol+", (FunctionRef(9, 275),)),
         ("Function 1001", (FunctionRef(9, 1001), FunctionRef(9, 277))),
     ]
+
+
+def test_unknown_step_types_are_kept_and_block_execution():
+    delay_then_power = [{"type": 33, "code": (9 << 16) | 530}, {"type": 1, "ms": 1000}, {"type": 33, "code": (9 << 16) | 1001}]
+    device = {
+        "id": 9,
+        "name": "HDA",
+        "pages": [
+            {
+                "name": "audio",
+                "buttons": [
+                    {"name": "Power", "macro": [{"type": 33, "code": (9 << 16) | 530}]},
+                    # Same type-33 subset as above plus a delay: must not collapse into it.
+                    {"name": "Power then input", "macro": delay_then_power},
+                    {"name": "Jump and power", "macro": [{"type": 54, "room": 4}, {"type": 33, "code": (9 << 16) | 530}]},
+                ],
+            }
+        ],
+    }
+    power, sequence = parse_core_model(_model(device)).rooms[0].devices[0].buttons
+    assert power.executable and power.steps == (FunctionRef(9, 530),)
+    assert not sequence.executable
+    assert sequence.steps == (
+        FunctionRef(9, 530),
+        UnsupportedStep(1, '{"ms":1000,"type":1}'),
+        FunctionRef(9, 1001),
+    )
 
 
 @pytest.mark.parametrize(

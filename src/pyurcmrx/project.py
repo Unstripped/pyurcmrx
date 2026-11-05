@@ -27,11 +27,29 @@ class FunctionRef:
 
 
 @dataclass(frozen=True, slots=True)
+class UnsupportedStep:
+    """A macro step of a type the spec does not define; kept so it is never dropped."""
+
+    type: int | None
+    data: str  # canonical JSON of the original step
+
+
+MacroStep = FunctionRef | UnsupportedStep
+
+
+@dataclass(frozen=True, slots=True)
 class Button:
     label: str
     hbtn_id: int | None
     page: str | None  # page name for page buttons, None for hard buttons
-    functions: tuple[FunctionRef, ...]  # type-33 steps in macro order
+    # Every controller-side step in macro order. Navigation steps (type 54) are UI-only
+    # and omitted; everything else is kept, including types this library cannot run.
+    steps: tuple[MacroStep, ...]
+
+    @property
+    def executable(self) -> bool:
+        """True only when every step is a device function a client can replay."""
+        return all(isinstance(step, FunctionRef) for step in self.steps)
 
 
 @dataclass(frozen=True, slots=True)
@@ -81,23 +99,29 @@ def _optional(obj: Any, key: str, kind: type) -> Any:
 
 
 def _button(raw: Any, page: str | None, where: str) -> Button | None:
-    """Return the button, or None when it is hidden or triggers no device function."""
+    """Return the button, or None when it is hidden or does nothing on the controller."""
     if not isinstance(raw, dict) or raw.get("hidden"):
         return None
-    functions = []
+    steps: list[MacroStep] = []
     for k, step in enumerate(raw.get("macro") or []):
-        if isinstance(step, dict) and step.get("type") == STEP_DEVICE_FUNCTION:
+        step_type = _optional(step, "type", int)
+        if step_type == STEP_ROOM_JUMP:
+            continue
+        if step_type == STEP_DEVICE_FUNCTION:
             code = _field(step, "code", int, f"{where}.macro[{k}]")
             try:
-                functions.append(decode_function_code(code))
+                steps.append(decode_function_code(code))
             except ValueError as err:
                 raise ProjectParseError(f"{where}.macro[{k}].code: {err}") from err
-    if not functions:
+        else:
+            steps.append(UnsupportedStep(step_type, json.dumps(step, sort_keys=True, separators=(",", ":"))))
+    if not steps:
         return None
     hbtn_id = _optional(raw, "hbtn_id", int)
     name = (_optional(raw, "name", str) or "").strip()
-    label = name or HARD_BUTTON_LABELS.get(hbtn_id) or f"Function {functions[0].func_id}"
-    return Button(label, hbtn_id, page, tuple(functions))
+    first = steps[0]
+    fallback = f"Function {first.func_id}" if isinstance(first, FunctionRef) else "Macro"
+    return Button(name or HARD_BUTTON_LABELS.get(hbtn_id) or fallback, hbtn_id, page, tuple(steps))
 
 
 def _device(raw: Any, where: str) -> Device:
@@ -110,11 +134,12 @@ def _device(raw: Any, where: str) -> Device:
         page_name = _optional(page, "name", str)
         for i, b in enumerate(_optional(page, "buttons", list) or []):
             candidates.append(_button(b, page_name, f"{where}.pages[{p}].buttons[{i}]"))
-    # The same function often appears as a hard button and on a page; keep the first.
-    buttons: dict[tuple[FunctionRef, ...], Button] = {}
+    # The same action often appears as a hard button and on a page; keep the first.
+    # Deduplicate on the full step sequence so different macros never collapse.
+    buttons: dict[tuple[MacroStep, ...], Button] = {}
     for button in candidates:
         if button is not None:
-            buttons.setdefault(button.functions, button)
+            buttons.setdefault(button.steps, button)
     return Device(
         id=_field(obj, "id", int, where),
         name=_field(obj, "name", str, where),

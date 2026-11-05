@@ -24,7 +24,17 @@ from .errors import (
     TelemetryParseError,
     UrcMrxError,
 )
-from .project import Button, CoreModel, Device, FunctionRef, Room, decode_function_code, parse_core_model
+from .project import (
+    Button,
+    CoreModel,
+    Device,
+    FunctionRef,
+    MacroStep,
+    Room,
+    UnsupportedStep,
+    decode_function_code,
+    parse_core_model,
+)
 from .staging import fetch_core_model, select_core_model
 from .telemetry import (
     MQTT_PORT,
@@ -52,6 +62,7 @@ __all__ = [
     "Device",
     "DiscoveredController",
     "FunctionRef",
+    "MacroStep",
     "HdaZoneStatus",
     "LinkStatus",
     "MalformedFrameError",
@@ -69,7 +80,7 @@ __all__ = [
     "TelemetryParseError",
     "UrcMrxError",
     "VariableStatus",
-    "build_probe",
+    "UnsupportedStep",
     "decode_function_code",
     "discover",
     "encode_request",
