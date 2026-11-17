@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 import shutil
 import socket
 import subprocess
@@ -104,6 +105,8 @@ def test_invalid_json_raises():
 def broker():
     exe = shutil.which("mosquitto") or shutil.which("/opt/homebrew/sbin/mosquitto")
     if exe is None:
+        if os.environ.get("PYURCMRX_REQUIRE_MOSQUITTO"):
+            pytest.fail("mosquitto not installed but PYURCMRX_REQUIRE_MOSQUITTO is set")
         pytest.skip("mosquitto not installed")
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))

@@ -4,7 +4,7 @@ Async Python client for URC Total Control MRX controllers on the local network. 
 
 This is a clean-room implementation. Its only source is the public [open-control-spec](https://github.com/Unstripped/open-control-spec); it contains no vendor code, keys, or assets. Not affiliated with Universal Remote Control, Inc.
 
-Licensed under the [MIT License](LICENSE).
+Licensed under the [MIT License](https://github.com/Unstripped/pyurcmrx/blob/development/LICENSE).
 
 ## Implemented
 
@@ -37,4 +37,11 @@ uv sync
 uv run pytest
 ```
 
-The MQTT subscriber test runs against a local `mosquitto` and is skipped when it is not installed.
+The MQTT subscriber test runs against a local `mosquitto` and is skipped when it is not installed; set `PYURCMRX_REQUIRE_MOSQUITTO=1` (as CI does) to fail instead of skip.
+
+## Releasing
+
+1. Bump `version` in `pyproject.toml` and merge to `development`.
+2. Tag `vX.Y.Z` on `development` and push the tag. `release.yml` runs the tests, checks the tag matches `pyproject.toml`, builds, publishes to PyPI and creates the GitHub release.
+
+One-time setup: a PyPI trusted publisher (project `pyurcmrx`, owner `Unstripped`, repo `pyurcmrx`, workflow `release.yml`, environment `pypi`) and a GitHub environment named `pypi`.
