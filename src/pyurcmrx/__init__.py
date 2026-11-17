@@ -8,13 +8,20 @@ from .control import (
     CONTROL_PORT,
     ActionFlags,
     ControlClient,
+    ControllerTime,
     Opcode,
-    ProjectIdentity,
     Response,
     ResponseDecoder,
     encode_request,
 )
-from .discovery import DISCOVERY_PORT, DiscoveredController, build_probe, discover, parse_find_ack
+from .discovery import (
+    DISCOVERY_PORT,
+    DiscoveredController,
+    build_probe,
+    discover,
+    parse_find_ack,
+    subnet_broadcast_addresses,
+)
 from .errors import (
     ActionRejectedError,
     CatalogUnavailableError,
@@ -58,6 +65,7 @@ __all__ = [
     "Button",
     "CatalogUnavailableError",
     "ControlClient",
+    "ControllerTime",
     "CoreModel",
     "Device",
     "DiscoveredController",
@@ -68,7 +76,6 @@ __all__ = [
     "MalformedFrameError",
     "Opcode",
     "OtherTelemetry",
-    "ProjectIdentity",
     "ProjectParseError",
     "ProtocolError",
     "Response",
@@ -90,5 +97,6 @@ __all__ = [
     "parse_telemetry",
     "rotating_checksum",
     "select_core_model",
+    "subnet_broadcast_addresses",
     "subscribe",
 ]

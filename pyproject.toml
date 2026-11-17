@@ -6,7 +6,10 @@ readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
 requires-python = ">=3.13"
-dependencies = ["aiomqtt>=2.5"]
+dependencies = [
+    "aiomqtt>=2.5",
+    "ifaddr>=0.2",
+]
 
 [project.scripts]
 pyurcmrx = "pyurcmrx.__main__:main"

@@ -1,9 +1,14 @@
-"""Runtime control protocol over TCP 51510 (spec §52 v0.2.0).
+"""Runtime control protocol over TCP 51510 (spec §52 v0.4.0).
 
 Framing: `type:u8 | length:u16le | opcode:u16le | payload`, where `length` counts the
 opcode plus payload (requests) or opcode + status + body (responses); wire size is
-`length + 3`. The protocol is strictly half-duplex: one request, one response, and the
+`length + 3`. Each connection is half-duplex: one request, then its response, and the
 controller never sends unsolicited frames on this socket (spec §52 §2.2).
+
+Connection lifetime depends on the opcode (spec §52 §4): only GET_FILE_TIME is
+documented as leaving the connection reusable. Every other request is treated as
+terminal, so the client closes the connection after its response and opens a new one
+for the next request.
 """
 
 from __future__ import annotations
@@ -20,8 +25,7 @@ CONTROL_PORT = 51510
 FRAME_STANDARD = 0x02
 HEADER_SIZE = 3
 STATUS_SUCCESS = 0x01
-KEEPALIVE_INTERVAL = 5.0  # spec §52 §4.1: probe every 5 s; controller drops after 10 s idle
-PROJECT_TOKEN_SIZE = 32
+FILE_TIME_BODY_SIZE = 48  # 4-byte local timestamp + 44-byte time-zone rule
 
 
 class Opcode(IntEnum):
@@ -36,6 +40,11 @@ class Opcode(IntEnum):
     GET_NET_STATUS = 0x0FE1
     GET_FILE_TIME = 0x0FE6
     QUERY_REPLY = 0xFFFD
+    QUERY_REPLY_OFFLINE = 0xFFFE  # GET_NET_STATUS reply when the controller is not online
+
+
+# Requests after which the controller keeps the connection open (spec §52 §4.3).
+REUSABLE_OPCODES = frozenset({Opcode.GET_FILE_TIME})
 
 
 class ActionFlags(IntEnum):
@@ -48,11 +57,16 @@ class ActionFlags(IntEnum):
 
 
 @dataclass(frozen=True, slots=True)
-class ProjectIdentity:
-    """GET_FILE_TIME reply: controller clock plus the active project's identity token."""
+class ControllerTime:
+    """GET_FILE_TIME reply (spec §52 §3.9).
 
-    timestamp: int
-    project_token: bytes
+    `local_timestamp` is a Unix-style timestamp already adjusted by the controller's
+    time-zone and daylight-saving offsets. `time_zone_rule` is the controller's opaque
+    44-byte time-zone rule block, kept verbatim.
+    """
+
+    local_timestamp: int
+    time_zone_rule: bytes
 
 
 @dataclass(frozen=True, slots=True)
@@ -99,30 +113,19 @@ class ResponseDecoder:
 class ControlClient:
     """Serialized request/response client for one controller.
 
-    The protocol is half-duplex and responses carry no request identifier, so requests
-    are strictly one-at-a-time. While connected, a GET_NET_STATUS keepalive is sent after
-    `keepalive` seconds of silence (pass None to disable). If the session drops anyway,
-    the next request reconnects.
+    Requests are strictly one-at-a-time. Each request runs on a fresh connection, except
+    that a connection left open by a reusable request (GET_FILE_TIME) carries the next one.
     """
 
-    def __init__(
-        self,
-        host: str,
-        port: int = CONTROL_PORT,
-        timeout: float = 5.0,
-        keepalive: float | None = KEEPALIVE_INTERVAL,
-    ) -> None:
+    def __init__(self, host: str, port: int = CONTROL_PORT, timeout: float = 5.0) -> None:
         self.host = host
         self.port = port
         self.timeout = timeout
-        self.keepalive = keepalive
         self._reader: asyncio.StreamReader | None = None
         self._writer: asyncio.StreamWriter | None = None
         self._decoder = ResponseDecoder()
         self._pending: list[Response] = []
         self._lock = asyncio.Lock()
-        self._keepalive_task: asyncio.Task[None] | None = None
-        self._last_send = 0.0
 
     async def __aenter__(self) -> ControlClient:
         return self
@@ -131,10 +134,7 @@ class ControlClient:
         await self.close()
 
     def _reset(self) -> StreamWriter | None:
-        """Drop the session synchronously (safe inside cancellation handling)."""
-        task, self._keepalive_task = self._keepalive_task, None
-        if task is not None and task is not asyncio.current_task():
-            task.cancel()
+        """Drop the connection synchronously (safe inside cancellation handling)."""
         writer, self._reader, self._writer = self._writer, None, None
         self._decoder = ResponseDecoder()
         self._pending.clear()
@@ -158,9 +158,6 @@ class ControlClient:
             return
         await self.close()
         self._reader, self._writer = await asyncio.open_connection(self.host, self.port)
-        self._last_send = asyncio.get_running_loop().time()
-        if self.keepalive is not None:
-            self._keepalive_task = asyncio.create_task(self._keepalive_loop())
 
     async def _read_response(self) -> Response:
         while not self._pending:
@@ -170,49 +167,30 @@ class ControlClient:
             self._pending.extend(self._decoder.feed(data))
         return self._pending.pop(0)
 
-    async def _exchange(self, frame: bytes, expect: int, *, connect: bool) -> Response:
-        """One transaction; caller holds the lock.
+    async def request(self, opcode: int, payload: bytes, *expect: int) -> Response:
+        """Send one request and return its response, whose opcode must be in `expect`.
 
         Any interruption (error, timeout, cancellation, wrong reply) leaves the stream
-        position unknown, so the session is dropped: a late reply must never be taken as
-        the answer to the next request (all actions share ACK opcode 0x07DB).
+        position unknown, so the connection is dropped: a late reply must never be taken
+        as the answer to the next request (all actions share ACK opcode 0x07DB).
         """
-        try:
-            async with asyncio.timeout(self.timeout):
-                if connect:
-                    await self._connect()
-                self._writer.write(frame)
-                self._last_send = asyncio.get_running_loop().time()
-                await self._writer.drain()
-                response = await self._read_response()
-            if response.opcode != expect:
-                raise ProtocolError(f"expected opcode 0x{expect:04X}, got 0x{response.opcode:04X}")
-        except BaseException:
-            self._reset()
-            raise
-        return response
-
-    async def _keepalive_loop(self) -> None:
-        loop = asyncio.get_running_loop()
-        frame = encode_request(Opcode.GET_NET_STATUS)
-        while True:
-            idle = loop.time() - self._last_send
-            if idle < self.keepalive:
-                await asyncio.sleep(self.keepalive - idle)
-                continue
-            async with self._lock:
-                if not self._connected():
-                    return
-                try:
-                    await self._exchange(frame, Opcode.QUERY_REPLY, connect=False)
-                except Exception:
-                    # Session already reset; the next request reconnects.
-                    return
-
-    async def request(self, opcode: int, payload: bytes, expect: int) -> Response:
         frame = encode_request(opcode, payload)
         async with self._lock:
-            return await self._exchange(frame, expect, connect=True)
+            try:
+                async with asyncio.timeout(self.timeout):
+                    await self._connect()
+                    self._writer.write(frame)
+                    await self._writer.drain()
+                    response = await self._read_response()
+                if response.opcode not in expect:
+                    wanted = " or ".join(f"0x{e:04X}" for e in expect)
+                    raise ProtocolError(f"expected opcode {wanted}, got 0x{response.opcode:04X}")
+            except BaseException:
+                self._reset()
+                raise
+            if opcode not in REUSABLE_OPCODES:
+                await self.close()
+            return response
 
     async def _action(self, opcode: int, payload: bytes) -> int:
         response = await self.request(opcode, payload, Opcode.ACTION_ACK)
@@ -224,16 +202,19 @@ class ControlClient:
         return queue_handle
 
     async def get_net_status(self) -> bool:
-        response = await self.request(Opcode.GET_NET_STATUS, b"", Opcode.QUERY_REPLY)
-        return response.ok
+        """True when the controller reports itself online (spec §52 §3.7)."""
+        response = await self.request(Opcode.GET_NET_STATUS, b"", Opcode.QUERY_REPLY, Opcode.QUERY_REPLY_OFFLINE)
+        return response.ok and response.opcode == Opcode.QUERY_REPLY
 
-    async def get_file_time(self) -> ProjectIdentity:
-        """Poll this to detect deployments: a changed `project_token` means a new project."""
+    async def get_file_time(self) -> ControllerTime:
+        """Read the controller's local time and time-zone rule (spec §52 §3.9)."""
         response = await self.request(Opcode.GET_FILE_TIME, b"", Opcode.QUERY_REPLY)
-        if len(response.body) < 4 + PROJECT_TOKEN_SIZE:
-            raise MalformedFrameError(f"GET_FILE_TIME body is {len(response.body)} bytes, need 36")
-        (timestamp,) = struct.unpack_from("<I", response.body, 0)
-        return ProjectIdentity(timestamp, bytes(response.body[4 : 4 + PROJECT_TOKEN_SIZE]))
+        if len(response.body) != FILE_TIME_BODY_SIZE:
+            raise MalformedFrameError(
+                f"GET_FILE_TIME body is {len(response.body)} bytes, need {FILE_TIME_BODY_SIZE}"
+            )
+        (local_timestamp,) = struct.unpack_from("<I", response.body, 0)
+        return ControllerTime(local_timestamp, response.body[4:])
 
     async def get_variables(self) -> dict[int, int]:
         response = await self.request(Opcode.VARIABLE_CMD_GET_TABLE, b"", Opcode.VARIABLE_TABLE)

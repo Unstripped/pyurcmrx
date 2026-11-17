@@ -1,21 +1,34 @@
-"""Controller discovery over UDP 61510 (spec §50)."""
+"""Controller discovery over UDP 61510 (spec §50 v0.3.0)."""
 
 from __future__ import annotations
 
 import asyncio
 import socket
 import struct
+import sys
 from dataclasses import dataclass
-from ipaddress import IPv4Address
+from ipaddress import IPv4Address, IPv4Interface
+
+import ifaddr
 
 from .errors import MalformedFrameError
 
 DISCOVERY_PORT = 61510
-BROADCAST_ADDRESS = "255.255.255.255"
 OPCODE_FIND = 0xC350
 OPCODE_FIND_ACK = 0xC353
 MODEL_WILDCARD = 0x0FFF
-FIND_ACK_SIZE = 0x3F + 32  # last field: 32-byte description at 0x3F
+FIND_ACK_SIZE = 55
+
+# Interface flags (identical on Linux and the BSDs) and the SIOCGIFFLAGS request that reads them.
+_IFF_BROADCAST = 0x2
+_IFF_LOOPBACK = 0x8
+_IFF_POINTOPOINT = 0x10
+if sys.platform == "linux":
+    _SIOCGIFFLAGS: int | None = 0x8913
+elif sys.platform == "darwin" or "bsd" in sys.platform:
+    _SIOCGIFFLAGS = 0xC0206911  # _IOWR('i', 17, struct ifreq)
+else:
+    _SIOCGIFFLAGS = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -24,55 +37,82 @@ class DiscoveredController:
     model_id: int
     mac: str
     ip: IPv4Address
-    netmask: IPv4Address
-    gateway: IPv4Address
-    dns: IPv4Address
-    model_name: str
     description: str
+    model_name: str
 
 
-def build_probe(seq: int, model_id: int = MODEL_WILDCARD, requester_ip: IPv4Address | None = None) -> bytes:
-    """Build a PACKET_FIND probe: 5 bytes, or 9 bytes with the requester's IPv4 address."""
-    probe = struct.pack(">BH", seq & 0xFF, OPCODE_FIND) + struct.pack("<H", model_id)
-    if requester_ip is not None:
-        probe += requester_ip.packed
+def build_probe(seq: int, model_id: int = MODEL_WILDCARD, reply_ip: IPv4Address | None = None) -> bytes:
+    """Build a PACKET_FIND probe (spec §50 §2.1).
+
+    5 bytes, answered with a broadcast; or 9 bytes when `reply_ip` is given, answered
+    with a unicast to that address.
+    """
+    probe = struct.pack("<BHH", seq & 0xFF, OPCODE_FIND, model_id)
+    if reply_ip is not None:
+        probe += reply_ip.packed
     return probe
 
 
-def _cstring(raw: bytes) -> str:
-    return raw.split(b"\0", 1)[0].decode("utf-8", errors="replace")
-
-
 def parse_find_ack(data: bytes) -> DiscoveredController:
-    """Parse a PACKET_FIND_ACK datagram (spec §50 §2.2)."""
-    if len(data) < FIND_ACK_SIZE:
-        raise MalformedFrameError(f"PACKET_FIND_ACK too short: {len(data)} bytes, need {FIND_ACK_SIZE}")
-    seq, opcode = struct.unpack_from(">BH", data, 0)
+    """Parse a 55-byte PACKET_FIND_ACK datagram (spec §50 §2.2)."""
+    if len(data) != FIND_ACK_SIZE:
+        raise MalformedFrameError(f"PACKET_FIND_ACK is {len(data)} bytes, need {FIND_ACK_SIZE}")
+    seq, opcode, model_id = struct.unpack_from("<BHH", data, 0)
     if opcode != OPCODE_FIND_ACK:
         raise MalformedFrameError(f"not a PACKET_FIND_ACK: opcode 0x{opcode:04X}")
-    (model_id,) = struct.unpack_from("<H", data, 0x03)
     return DiscoveredController(
         seq=seq,
         model_id=model_id,
-        mac=":".join(f"{b:02X}" for b in data[0x09:0x0F]),
-        ip=IPv4Address(data[0x0F:0x13]),
-        netmask=IPv4Address(data[0x13:0x17]),
-        gateway=IPv4Address(data[0x17:0x1B]),
-        dns=IPv4Address(data[0x1B:0x1F]),
-        model_name=_cstring(data[0x1F:0x3F]),
-        description=_cstring(data[0x3F:0x5F]),
+        mac=":".join(f"{b:02X}" for b in data[0x05:0x0B]),
+        ip=IPv4Address(data[0x0B:0x0F]),
+        description=data[0x0F:0x2D].rstrip(b"\0").decode("utf-8", errors="replace"),
+        model_name=data[0x2D:0x37].rstrip(b"\0 \t\n\r\x0b\x0c").decode("utf-8", errors="replace"),
     )
+
+
+def _interface_flags(sock: socket.socket, name: str) -> int | None:
+    if _SIOCGIFFLAGS is None:
+        return None
+    import fcntl
+
+    # struct ifreq: 16-byte name, then the flags short; padded to the largest ifreq size.
+    ifreq = struct.pack("16sH", name.encode(), 0).ljust(40, b"\0")
+    try:
+        return struct.unpack_from("H", fcntl.ioctl(sock.fileno(), _SIOCGIFFLAGS, ifreq), 16)[0]
+    except OSError:
+        return None
+
+
+def subnet_broadcast_addresses() -> list[str]:
+    """Directed broadcast address of every local IPv4 broadcast interface.
+
+    Loopback and point-to-point interfaces, and networks too small to have a broadcast
+    address (/31, /32), are skipped.
+    """
+    addresses: list[str] = []
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+        for adapter in ifaddr.get_adapters():
+            flags = _interface_flags(sock, adapter.name)
+            if flags is not None and (not flags & _IFF_BROADCAST or flags & (_IFF_LOOPBACK | _IFF_POINTOPOINT)):
+                continue
+            for ip in adapter.ips:
+                if not isinstance(ip.ip, str) or ip.network_prefix >= 31:
+                    continue
+                interface = IPv4Interface(f"{ip.ip}/{ip.network_prefix}")
+                broadcast = str(interface.network.broadcast_address)
+                if not interface.is_loopback and broadcast not in addresses:
+                    addresses.append(broadcast)
+    return addresses
 
 
 class _DiscoveryProtocol(asyncio.DatagramProtocol):
     def __init__(self, seq: int) -> None:
         self._seq = seq
         self.found: dict[str, DiscoveredController] = {}
-        self.send_error: OSError | None = None
+        self.send_errors: list[OSError] = []
         self.closed: asyncio.Future[None] = asyncio.get_running_loop().create_future()
 
     def datagram_received(self, data: bytes, addr: tuple[str, int]) -> None:
-        # Our own broadcast probe loops back on the shared port; it fails the opcode check.
         try:
             controller = parse_find_ack(data)
         except MalformedFrameError:
@@ -83,8 +123,7 @@ class _DiscoveryProtocol(asyncio.DatagramProtocol):
     def error_received(self, exc: OSError) -> None:
         # asyncio reports a failed sendto here instead of raising it, immediately or,
         # for a queued datagram, on a later loop iteration.
-        if self.send_error is None:
-            self.send_error = exc
+        self.send_errors.append(exc)
 
     def connection_lost(self, exc: Exception | None) -> None:
         if not self.closed.done():
@@ -95,17 +134,24 @@ async def discover(
     timeout: float = 2.0,
     *,
     seq: int = 1,
-    target: str = BROADCAST_ADDRESS,
+    target: str | None = None,
     target_port: int = DISCOVERY_PORT,
-    bind_port: int = DISCOVERY_PORT,
+    bind_port: int = 0,
 ) -> list[DiscoveredController]:
-    """Broadcast a probe and collect PACKET_FIND_ACK replies for `timeout` seconds.
+    """Send a 5-byte PACKET_FIND and collect PACKET_FIND_ACK replies for `timeout` seconds.
 
-    Controllers reply to UDP 61510 on the requester (spec §50 §2.2), so the socket
-    binds that port by default. Results are de-duplicated by MAC address. Raises
-    OSError when the probe cannot be sent (e.g. no route to the target), rather
+    The probe goes to `target` (a controller's unicast address or a broadcast address),
+    or by default to the subnet broadcast address of every local IPv4 interface
+    (spec §50 §4.1). Controllers answer to the probe's UDP source port (spec §50 §2.3),
+    so replies are read on the socket that sent it; `bind_port = 0` picks an ephemeral
+    port. Results are de-duplicated by MAC address.
+
+    Raises OSError when no probe could be sent (e.g. no route to any target), rather
     than reporting that no controller answered.
     """
+    targets = [target] if target is not None else subnet_broadcast_addresses()
+    if not targets:
+        raise OSError("no IPv4 interface with a broadcast address; pass a target")
     loop = asyncio.get_running_loop()
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
@@ -118,11 +164,13 @@ async def discover(
         raise
     transport, protocol = await loop.create_datagram_endpoint(lambda: _DiscoveryProtocol(seq), sock=sock)
     try:
-        transport.sendto(build_probe(seq), (target, target_port))
-        if protocol.send_error is None:
+        probe = build_probe(seq)
+        for address in targets:
+            transport.sendto(probe, (address, target_port))
+        if len(protocol.send_errors) < len(targets):
             await asyncio.sleep(timeout)
-        if protocol.send_error is not None:
-            raise protocol.send_error
+        if len(protocol.send_errors) >= len(targets):
+            raise protocol.send_errors[0]
     finally:
         # close() releases the socket on a later loop iteration; wait so the port is free on return.
         transport.close()

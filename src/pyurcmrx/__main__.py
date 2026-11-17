@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import sys
+from datetime import UTC, datetime
 from pathlib import Path
 
 import aiomqtt
@@ -18,7 +19,7 @@ from .telemetry import OtherTelemetry, subscribe
 
 
 async def _discover(args: argparse.Namespace) -> None:
-    controllers = await discover(args.timeout)
+    controllers = await discover(args.timeout, target=args.target)
     if not controllers:
         print("no controllers answered")
     for c in controllers:
@@ -28,9 +29,11 @@ async def _discover(args: argparse.Namespace) -> None:
 async def _status(args: argparse.Namespace) -> None:
     async with ControlClient(args.host) as client:
         print(f"online: {await client.get_net_status()}")
-        identity = await client.get_file_time()
-        print(f"controller time: {identity.timestamp}")
-        print(f"project token: {identity.project_token.hex()}")
+        time = await client.get_file_time()
+        # The timestamp already includes the controller's zone offset: render it as wall-clock time.
+        wall_clock = datetime.fromtimestamp(time.local_timestamp, UTC).strftime("%Y-%m-%d %H:%M:%S")
+        print(f"controller time: {wall_clock} (local_timestamp {time.local_timestamp})")
+        print(f"time-zone rule: {time.time_zone_rule.hex()}")
 
 
 async def _variables(args: argparse.Namespace) -> None:
@@ -87,11 +90,16 @@ def main() -> None:
     parser = argparse.ArgumentParser(prog="pyurcmrx")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    p = sub.add_parser("discover", help="broadcast a discovery probe on UDP 61510")
+    p = sub.add_parser("discover", help="send a discovery probe on UDP 61510")
+    p.add_argument(
+        "target",
+        nargs="?",
+        help="controller or broadcast address (default: every local subnet broadcast address)",
+    )
     p.add_argument("--timeout", type=float, default=2.0)
     p.set_defaults(run=_discover)
 
-    p = sub.add_parser("status", help="query network status and project identity")
+    p = sub.add_parser("status", help="query network status and controller time")
     p.add_argument("host")
     p.set_defaults(run=_status)
 
