@@ -14,7 +14,11 @@ class ProtocolError(UrcMrxError):
 
 
 class ActionRejectedError(UrcMrxError):
-    """The controller acknowledged an action with status 0x00 (spec §52 §4.3)."""
+    """The controller rejected a request: generic negative `0xFFFE`, or status other than 0x01.
+
+    Spec §52 §2.2 and §2.3: `0xFFFE` is negative whatever its status byte, and any other
+    reply with a status other than 0x01 is treated as a failure.
+    """
 
 
 class ProjectParseError(UrcMrxError):

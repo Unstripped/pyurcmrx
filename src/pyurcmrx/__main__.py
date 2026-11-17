@@ -11,12 +11,14 @@ from pathlib import Path
 
 import aiomqtt
 
-from .control import ControlClient
+from .control import ControlClient, Response, encode_trigger_code
 from .discovery import discover
 from .errors import UrcMrxError
-from .project import CoreModel, FunctionRef, parse_core_model
-from .staging import fetch_core_model
+from .project import Button, ButtonTrigger, CoreModel, MacroStep, parse_core_model
+from .staging import DEFAULT_CLIENT_MODEL, fetch_core_model
 from .telemetry import OtherTelemetry, subscribe
+
+_ON_OFF = {"on": True, "off": False}
 
 
 async def _discover(args: argparse.Namespace) -> None:
@@ -31,9 +33,10 @@ async def _status(args: argparse.Namespace) -> None:
     async with ControlClient(args.host) as client:
         print(f"online: {await client.get_net_status()}")
         time = await client.get_file_time()
-        # The timestamp already includes the controller's zone offset: render it as wall-clock time.
+        # local_timestamp counts the controller's local wall-clock seconds, not UTC (spec §52
+        # §3.9): format it without any zone conversion so the host's offset is not applied.
         wall_clock = datetime.fromtimestamp(time.local_timestamp, UTC).strftime("%Y-%m-%d %H:%M:%S")
-        print(f"controller time: {wall_clock} (local_timestamp {time.local_timestamp})")
+        print(f"controller time: {wall_clock} local (local_timestamp {time.local_timestamp})")
         print(f"time-zone rule: {time.time_zone_rule.hex()}")
 
 
@@ -44,38 +47,83 @@ async def _variables(args: argparse.Namespace) -> None:
 
 
 async def _macro(args: argparse.Namespace) -> None:
+    if args.trigger_code is not None and args.object is None and args.button is None:
+        code = args.trigger_code
+    elif args.trigger_code is None and args.object is not None and args.button is not None:
+        code = encode_trigger_code(args.object, args.button)
+    else:
+        raise SystemExit("macro needs either TRIGGER_CODE or both --object and --button")
     async with ControlClient(args.host) as client:
-        handle = await client.macro_action(args.room, args.device, args.macro, args.flags)
-        print(f"accepted, queue handle {handle}")
+        await client.macro_action(code)
+        print("acknowledged")
 
 
 async def _volume(args: argparse.Namespace) -> None:
     async with ControlClient(args.host) as client:
-        handle = await client.set_volume(args.device, args.level, mute=args.mute)
-        print(f"accepted, queue handle {handle}")
+        await client.set_volume(
+            args.trigger_code, args.level, min_value=args.min_value, max_value=args.max_value, mute=args.mute
+        )
+        print("acknowledged")
+
+
+def _print_reply(reply: Response | None) -> None:
+    # The success reply for room/zone audio is not established (spec §52 §3.11): show it raw.
+    if reply is None:
+        print("no reply")
+    else:
+        print(f"reply opcode 0x{reply.opcode:04X} status 0x{reply.status:02X} body {reply.body.hex() or '(empty)'}")
+
+
+async def _room_volume(args: argparse.Namespace) -> None:
+    async with ControlClient(args.host) as client:
+        _print_reply(await client.set_room_volume(args.room, args.value))
+
+
+async def _room_mute(args: argparse.Namespace) -> None:
+    async with ControlClient(args.host) as client:
+        _print_reply(await client.set_room_mute(args.room, _ON_OFF[args.state]))
+
+
+async def _zone_volume(args: argparse.Namespace) -> None:
+    async with ControlClient(args.host) as client:
+        _print_reply(await client.set_zone_volume(args.con_dev, args.zone, args.value))
+
+
+async def _zone_mute(args: argparse.Namespace) -> None:
+    async with ControlClient(args.host) as client:
+        _print_reply(await client.set_zone_mute(args.con_dev, args.zone, _ON_OFF[args.state]))
+
+
+def _describe_step(step: MacroStep) -> str:
+    if isinstance(step, ButtonTrigger):
+        return f"trigger {step.trigger_code} (object {step.object_id} button {step.button_id})"
+    return f"room {step.room_id} power off"
+
+
+def _print_buttons(buttons: tuple[Button, ...], indent: str) -> None:
+    for button in buttons:
+        page = f" [{button.page}]" if button.page else ""
+        print(f"{indent}{button.label}{page}: {', '.join(_describe_step(s) for s in button.steps)}")
 
 
 def _print_catalog(model: CoreModel) -> None:
     print(f"system: {model.system_name or '(unnamed)'}")
     for room in model.rooms:
         print(f"room {room.id}: {room.name}")
+        if room.menu:
+            print("  menu:")
+            _print_buttons(room.menu, "    ")
         for device in room.devices:
-            print(f"  device {device.id}: {device.name} ({device.device_type or '?'})")
-            for button in device.buttons:
-                steps = ", ".join(
-                    f"device {s.device_id} function {s.func_id}" if isinstance(s, FunctionRef) else f"unsupported {s.data}"
-                    for s in button.steps
-                )
-                page = f" [{button.page}]" if button.page else ""
-                runnable = "" if button.executable else " (not executable)"
-                print(f"    {button.label}{page}{runnable}: {steps}")
+            connected = f", connected device {device.con_dev_id}" if device.con_dev_id is not None else ""
+            print(f"  device {device.id}: {device.name} ({device.device_type or '?'}){connected}")
+            _print_buttons(device.buttons, "    ")
 
 
 async def _catalog(args: argparse.Namespace) -> None:
     if args.file is not None:
         _print_catalog(parse_core_model(args.file.read_bytes()))
     elif args.host is not None:
-        _print_catalog(await fetch_core_model(args.host))
+        _print_catalog(await fetch_core_model(args.host, client_model=args.client_model))
     else:
         raise SystemExit("catalog needs HOST or --file")
 
@@ -108,24 +156,56 @@ def main() -> None:
     p.add_argument("host")
     p.set_defaults(run=_variables)
 
-    p = sub.add_parser("macro", help="send MACRO_ACTION")
+    p = sub.add_parser("macro", help="trigger a project button with MACRO_ACTION (0x07DA)")
     p.add_argument("host")
-    p.add_argument("room", type=int, help="room ID, or 0 to let the controller resolve a device's room")
-    p.add_argument("device", type=int, help="device ID, or 0 for a room/house macro")
-    p.add_argument("macro", type=int, help="device function ID, or room macro ID / trigger code")
-    p.add_argument("--flags", type=int, default=0, help="0 single, 1 press, 2 release, 3 hold")
+    p.add_argument("trigger_code", type=int, nargs="?", help="button code from the catalog")
+    p.add_argument("--object", type=int, help="UI object id; with --button, instead of TRIGGER_CODE")
+    p.add_argument("--button", type=int, help="button id; with --object, instead of TRIGGER_CODE")
     p.set_defaults(run=_macro)
 
-    p = sub.add_parser("volume", help="set absolute volume with 0x07ED")
+    p = sub.add_parser("volume", help="set an absolute level through a project volume control (0x07ED)")
     p.add_argument("host")
-    p.add_argument("device", type=int)
-    p.add_argument("level", type=int, help="0..100")
+    p.add_argument("trigger_code", type=int, help="trigger code of the project volume control")
+    p.add_argument("level", type=int, help="raw device-dependent level")
+    p.add_argument("--min", dest="min_value", type=int, required=True, help="raw minimum of the control")
+    p.add_argument("--max", dest="max_value", type=int, required=True, help="raw maximum of the control")
     p.add_argument("--mute", action="store_true")
     p.set_defaults(run=_volume)
 
-    p = sub.add_parser("catalog", help="print rooms, devices and buttons from core_model.json")
+    p = sub.add_parser("room-volume", help="set a room's audio zone level (0x007D)")
+    p.add_argument("host")
+    p.add_argument("room", type=int, help="room id")
+    p.add_argument("value", type=int, help="raw zone level")
+    p.set_defaults(run=_room_volume)
+
+    p = sub.add_parser("room-mute", help="mute or unmute a room's audio zone (0x007E)")
+    p.add_argument("host")
+    p.add_argument("room", type=int, help="room id")
+    p.add_argument("state", choices=_ON_OFF)
+    p.set_defaults(run=_room_mute)
+
+    p = sub.add_parser("zone-volume", help="set one zone of a connected audio device (0x0097)")
+    p.add_argument("host")
+    p.add_argument("con_dev", type=int, help="connected-device id (mcs.dat)")
+    p.add_argument("zone", type=int, help="zone index")
+    p.add_argument("value", type=int, help="raw zone level")
+    p.set_defaults(run=_zone_volume)
+
+    p = sub.add_parser("zone-mute", help="mute or unmute one zone of a connected audio device (0x0098)")
+    p.add_argument("host")
+    p.add_argument("con_dev", type=int, help="connected-device id (mcs.dat)")
+    p.add_argument("zone", type=int, help="zone index")
+    p.add_argument("state", choices=_ON_OFF)
+    p.set_defaults(run=_zone_mute)
+
+    p = sub.add_parser("catalog", help="print rooms, menus, devices and buttons from core_model.json")
     p.add_argument("host", nargs="?", help="fetch from the controller over anonymous FTP")
     p.add_argument("--file", type=Path, help="read a local core_model.json instead")
+    p.add_argument(
+        "--client-model",
+        default=DEFAULT_CLIENT_MODEL,
+        help=f"client model whose manifest names the core model (default {DEFAULT_CLIENT_MODEL})",
+    )
     p.set_defaults(run=_catalog)
 
     p = sub.add_parser("watch", help="stream MQTT state telemetry")

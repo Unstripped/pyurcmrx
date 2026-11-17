@@ -16,7 +16,7 @@ FIND_ACK_VECTOR = bytes.fromhex(
     "01 53 C3 08 80 02 00 00 00 00 01 C0 00 02 2B 00"
     "00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00"
     "00 00 00 00 00 00 00 00 00 00 00 00 00 4D 52 58"
-    "2D 31 35 00 00 00 00"
+    "2D 31 35 0A 00 00 00"
 )
 
 
@@ -40,10 +40,22 @@ def test_parse_ack_spec_vector():
     assert (c.description, c.model_name) == ("", "MRX-15")
 
 
-def test_parse_ack_trims_padding_and_model_name_whitespace():
-    data = FIND_ACK_VECTOR[:0x0F] + b"Main Rack".ljust(30, b"\0") + b"MRX-15 \n\0\0"
+def test_parse_ack_text_fields_cut_at_first_nul_then_strip_line_terminators():
+    # §2.2.1: the description line keeps its 0x0A; bytes after the first 0x00 are ignored.
+    data = FIND_ACK_VECTOR[:0x0F] + b"Main Rack \r\n\0junk".ljust(30, b"\0") + b"MRX-15\n\0X\0"
     c = parse_find_ack(data)
     assert (c.description, c.model_name) == ("Main Rack", "MRX-15")
+
+
+def test_parse_ack_full_width_description_has_no_terminator():
+    data = FIND_ACK_VECTOR[:0x0F] + b"D" * 30 + FIND_ACK_VECTOR[0x2D:]
+    assert parse_find_ack(data).description == "D" * 30
+
+
+def test_parse_ack_decodes_non_ascii_as_utf8_with_replacement():
+    data = FIND_ACK_VECTOR[:0x0F] + "Café".encode().ljust(30, b"\0") + b"MRX\xff\n".ljust(10, b"\0")
+    c = parse_find_ack(data)
+    assert (c.description, c.model_name) == ("Café", "MRX\ufffd")
 
 
 @pytest.mark.parametrize(

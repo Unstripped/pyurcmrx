@@ -1,4 +1,4 @@
-"""Controller discovery over UDP 61510 (spec §50 v0.3.0)."""
+"""Controller discovery over UDP 61510 (spec §50 v0.4.0)."""
 
 from __future__ import annotations
 
@@ -47,13 +47,25 @@ class DiscoveredController:
 def build_probe(seq: int, model_id: int = MODEL_WILDCARD, reply_ip: IPv4Address | None = None) -> bytes:
     """Build a PACKET_FIND probe (spec §50 §2.1).
 
-    5 bytes, answered with a broadcast; or 9 bytes when `reply_ip` is given, answered
-    with a unicast to that address.
+    5 bytes, answered with a broadcast to 255.255.255.255; or 9 bytes when `reply_ip` is
+    given, answered with a unicast to that address (spec §50 §2.3). A `model_id` whose low
+    12 bits are 0xFFF is a wildcard; any other value must equal the controller's model
+    identifier exactly, otherwise the controller ignores the probe.
     """
     probe = struct.pack("<BHH", seq & 0xFF, OPCODE_FIND, model_id)
     if reply_ip is not None:
         probe += reply_ip.packed
     return probe
+
+
+def _text_field(field: bytes) -> str:
+    """Decode a PACKET_FIND_ACK text field (spec §50 §2.2.1).
+
+    Read up to the first 0x00 (or the field end), remove trailing 0x0A, 0x0D and ASCII
+    whitespace, then decode as UTF-8 with replacement; the encoding of 0x80-0xFF is not
+    established.
+    """
+    return field.split(b"\0", 1)[0].rstrip(b" \t\n\r\x0b\x0c").decode("utf-8", errors="replace")
 
 
 def parse_find_ack(data: bytes) -> DiscoveredController:
@@ -68,8 +80,8 @@ def parse_find_ack(data: bytes) -> DiscoveredController:
         model_id=model_id,
         mac=":".join(f"{b:02X}" for b in data[0x05:0x0B]),
         ip=IPv4Address(data[0x0B:0x0F]),
-        description=data[0x0F:0x2D].rstrip(b"\0").decode("utf-8", errors="replace"),
-        model_name=data[0x2D:0x37].rstrip(b"\0 \t\n\r\x0b\x0c").decode("utf-8", errors="replace"),
+        description=_text_field(data[0x0F:0x2D]),
+        model_name=_text_field(data[0x2D:0x37]),
     )
 
 
@@ -143,11 +155,13 @@ async def discover(
 ) -> list[DiscoveredController]:
     """Send a 5-byte PACKET_FIND and collect PACKET_FIND_ACK replies for `timeout` seconds.
 
-    The probe goes to `target` (a controller's unicast address or a broadcast address),
-    or by default to the subnet broadcast address of every local IPv4 interface
-    (spec §50 §4.1). Controllers answer to the probe's UDP source port (spec §50 §2.3),
-    so replies are read on the socket that sent it; `bind_port = 0` picks an ephemeral
-    port. Results are de-duplicated by MAC address.
+    The probe goes to `target` (a controller's unicast address, a subnet-directed
+    broadcast address, or 255.255.255.255; all confirmed, spec §50 §2.3, §4.1), or by
+    default to the subnet broadcast address of every local IPv4 interface, as §2.3
+    recommends for multi-homed clients instead of one limited-broadcast probe.
+    Controllers answer to the probe's UDP source port (spec §50 §2.3), so replies are
+    read on the socket that sent it; `bind_port = 0` picks an ephemeral port. Results
+    are de-duplicated by MAC address.
 
     A target whose probe cannot be sent is logged at WARNING with its address and the
     OSError, and the remaining targets are still probed, so controllers on working

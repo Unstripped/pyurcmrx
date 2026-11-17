@@ -9,10 +9,11 @@ import aiomqtt
 import pytest
 
 from pyurcmrx import (
+    HdaAmpStatus,
+    HdaInputStatus,
     HdaZoneStatus,
     LinkStatus,
     OtherTelemetry,
-    RoomZone,
     RoomZoneStatus,
     TelemetryParseError,
     VariableStatus,
@@ -20,62 +21,104 @@ from pyurcmrx import (
     subscribe,
 )
 
-# Bodies are the spec §00 §5.2.2 examples.
-HDA_BODY = {
-    "volume": {"type": "variable", "min": "0", "max": "100", "level": "45"},
-    "mute": "off",
-    "power": "on",
-    "treble": "0",
-    "bass": "0",
-    "balance": "0",
-    "lipsync": "0",
-    "thermal": "normal",
-    "peak": "not_clipping",
-    "amp": "normal",
-    "roomid": 1,
-    "roomname": "Living Room",
-    "roomindex": 0,
-    "hdaid": 3,
-    "zoneid": "z1lr",
-}
+# Spec §00 §5.2.2 example bodies, verbatim.
+SPEC_ROOM_BODY = '{"zone_power": 1, "cur_vol": 45, "min_vol": 0, "max_vol": 100, "mute": 0, "fixed": 0}'
+SPEC_HDA_BODY = """{
+  "amp": {"peak": "normal", "thermal": "normal"},
+  "balance": "0", "bass": "0", "treble": "0", "lipsync": "0",
+  "ducking": {"status": "off"}, "eq": "Off", "eqcustomname": "Custom",
+  "hdaid": "2", "inputdevname": "Source", "inputhdaid": "2", "inputhdaport": "1",
+  "mute": "off", "power": "on", "roomid": "2", "roomindex": "2",
+  "roomname": "Room", "stereo": "stereo",
+  "volume": {"level": "45", "max": "100", "min": "0", "type": "variable"},
+  "zoneid": "z1lr"
+}"""
+SPEC_INPUT_BODY = '{"audiosense":"not_sensing","hdaid":"2","inputport":"1"}'
+SPEC_AMP_BODY = '{"hdaid":"2","zoneid":"1","leftpeak":"normal","leftthermal":"normal","rightpeak":"normal","rightthermal":"normal"}'
+
+# Bodies observed on a real MRX-15 (issue #6), verbatim.
+OBSERVED_ROOM_BODY = '{"cur_vol":81,"fixed":0,"max_vol":100,"min_vol":0,"mute":0,"zone_power":1}'
+OBSERVED_HDA_BODY = '{"amp":{"peak":"normal","thermal":"normal"},"balance":"0","bass":"0","ducking":{"status":"off"},"eq":"Off","eqcustomname":"Custom","hdaid":"2","inputdevname":"APPLE TV GYM","inputhdaid":"2","inputhdaport":"1","lipsync":"0","mute":"off","power":"on","roomid":"2","roomindex":"2","roomname":"Exercise Room","stereo":"stereo","treble":"0","volume":{"level":"81","max":"100","min":"0","type":"variable"},"zoneid":"z1lr"}'
+
+ROOM_TOPIC = "tcsystem/global/room_event/zone_status/room_id_2"
+HDA_TOPIC = "tcsystem/global/hda/zone/2/0/"
 
 
-def envelope(topic: str, body) -> bytes:
-    return json.dumps({"header": {"version": "0.0.0.0", "seq": 104, "time_stamp": 1663794348, "tree": topic}, "body": body}).encode()
+def envelope(topic: str, body: str, time_stamp: int = 1663794348) -> bytes:
+    """Spec §00 §5.2.1 envelope around a JSON body text."""
+    header = {"version": "0.0.0.0", "seq": 0, "time_stamp": time_stamp, "tree": topic}
+    return f'{{"header": {json.dumps(header)}, "body": {body}}}'.encode()
 
 
-def test_room_zone_status():
-    topic = "tcsystem/global/room_event/zone_status/room_id_1"
-    body = [{"room_id": 1, "zone_power": 1, "cur_vol": 45, "min_vol": 0, "max_vol": 100, "mute": 0, "fixed": 0}]
-    t = parse_telemetry(topic, envelope(topic, body))
-    assert (t.seq, t.timestamp) == (104, 1663794348)
-    assert t.event == RoomZoneStatus(1, (RoomZone(1, True, 45, 0, 100, False, False),))
+def test_room_zone_status_takes_room_from_topic():
+    t = parse_telemetry(ROOM_TOPIC, envelope(ROOM_TOPIC, SPEC_ROOM_BODY))
+    assert (t.seq, t.timestamp) == (0, 1663794348)
+    assert t.event == RoomZoneStatus(2, True, 45, 0, 100, False, False)
 
 
-def test_hda_zone_converts_string_fields():
-    topic = "tcsystem/global/hda/zone/3/0/"
-    event = parse_telemetry(topic, envelope(topic, HDA_BODY)).event
+def test_room_zone_status_observed_body():
+    event = parse_telemetry(ROOM_TOPIC, envelope(ROOM_TOPIC, OBSERVED_ROOM_BODY)).event
+    assert event == RoomZoneStatus(2, True, 81, 0, 100, False, False)
+
+
+def test_hda_zone_spec_example():
+    event = parse_telemetry(HDA_TOPIC, envelope(HDA_TOPIC, SPEC_HDA_BODY)).event
     assert isinstance(event, HdaZoneStatus)
-    assert (event.device_id, event.zone_idx, event.power, event.mute, event.volume, event.max_volume) == (3, 0, True, False, 45, 100)
-    assert (event.fixed, event.room_id, event.room_name, event.zone_port) == (False, 1, "Living Room", "z1lr")
+    assert (event.hda, event.zone, event.power, event.mute, event.fixed) == (2, 0, True, False, False)
+    assert (event.volume, event.min_volume, event.max_volume) == (45, 0, 100)
+    assert (event.amp_peak, event.amp_thermal) == ("normal", "normal")
+    assert (event.room_id, event.room_index, event.hda_id, event.zone_id) == (2, "2", "2", "z1lr")
+    assert event.body == json.loads(SPEC_HDA_BODY)
+
+
+def test_room_and_hda_views_of_one_change_stay_separate():
+    # Issue #6: one change produced both topics with the same time_stamp (cur_vol 81 / level "81").
+    room = parse_telemetry(ROOM_TOPIC, envelope(ROOM_TOPIC, OBSERVED_ROOM_BODY, 1700000000))
+    hda = parse_telemetry(HDA_TOPIC, envelope(HDA_TOPIC, OBSERVED_HDA_BODY, 1700000000))
+    assert isinstance(room.event, RoomZoneStatus) and isinstance(hda.event, HdaZoneStatus)
+    assert room.event.volume == hda.event.volume == 81
+    assert hda.event.room_id == room.event.room_id == 2
+    assert hda.event.body["inputdevname"] == "APPLE TV GYM"
+
+
+def test_hda_zone_tolerates_unknown_values_and_extra_fields():
+    body = json.loads(SPEC_HDA_BODY)
+    body.update(power="standby", extra={"x": 1}, roomid=2, amp={"peak": "clipping", "thermal": "hot"})
+    body["volume"] = {**body["volume"], "type": "stepped"}
+    event = parse_telemetry(HDA_TOPIC, envelope(HDA_TOPIC, json.dumps(body))).event
+    assert (event.power, event.fixed, event.room_id) == (None, None, 2)
+    assert (event.amp_peak, event.amp_thermal) == ("clipping", "hot")
 
 
 def test_hda_zone_topic_requires_trailing_slash():
-    topic = "tcsystem/global/hda/zone/3/0"
-    assert isinstance(parse_telemetry(topic, envelope(topic, HDA_BODY)).event, OtherTelemetry)
+    topic = "tcsystem/global/hda/zone/2/0"
+    assert isinstance(parse_telemetry(topic, envelope(topic, SPEC_HDA_BODY)).event, OtherTelemetry)
+
+
+def test_hda_input_status():
+    topic = "tcsystem/global/hda/input/2/1/"
+    event = parse_telemetry(topic, envelope(topic, SPEC_INPUT_BODY)).event
+    assert event == HdaInputStatus(2, 1, "not_sensing", "2", "1", json.loads(SPEC_INPUT_BODY))
+
+
+def test_hda_amp_status():
+    topic = "tcsystem/global/hda/ampstatus/2/1/"
+    event = parse_telemetry(topic, envelope(topic, SPEC_AMP_BODY)).event
+    assert event == HdaAmpStatus(2, 1, "normal", "normal", "normal", "normal", "2", "1", json.loads(SPEC_AMP_BODY))
 
 
 def test_variable_and_link_status():
     topic = "tcsystem/global/variable_status/variable_id_7"
-    assert parse_telemetry(topic, envelope(topic, {"variable_type": 0, "value": "1"})).event == VariableStatus(7, 0, "1")
+    body = '{\n  "variable_type": 0,\n  "value": "1"\n}'
+    assert parse_telemetry(topic, envelope(topic, body)).event == VariableStatus(7, 0, "1")
     topic = "tcsystem/global/room_event/link_status/link_id_1"
-    body = {"link_id": 1, "roomid": 1, "roomname": "Living Room", "linked_rooms": [1, 2]}
+    body = '{\n  "link_id": 1,\n  "roomid": 1,\n  "roomname": "Living Room",\n  "linked_rooms": [1, 2]\n}'
     assert parse_telemetry(topic, envelope(topic, body)).event == LinkStatus(1, 1, "Living Room", (1, 2))
 
 
 def test_unmodelled_topic_passes_body_through():
-    topic = "tcsystem/global/hda/input/3/1/"
-    assert parse_telemetry(topic, envelope(topic, {"level": "0"})).event == OtherTelemetry({"level": "0"})
+    topic = "tcsystem/global/camera_popup"
+    assert parse_telemetry(topic, envelope(topic, '{"popup_status": 1}')).event == OtherTelemetry({"popup_status": 1})
 
 
 def test_empty_payload_is_a_retained_clear():
@@ -85,15 +128,18 @@ def test_empty_payload_is_a_retained_clear():
 @pytest.mark.parametrize(
     "topic, body, message",
     [
-        ("tcsystem/global/hda/zone/3/0/", {**HDA_BODY, "power": "maybe"}, "body.power: expected 'on' or 'off'"),
-        ("tcsystem/global/hda/zone/3/0/", {**HDA_BODY, "volume": {**HDA_BODY["volume"], "level": "loud"}}, "body.volume.level"),
-        ("tcsystem/global/room_event/zone_status/room_id_1", {"cur_vol": 1}, "body is not an array"),
-        ("tcsystem/global/room_event/zone_status/room_id_1", [{"room_id": 1}], "body[0]: missing 'zone_power'"),
+        (HDA_TOPIC, {**json.loads(SPEC_HDA_BODY), "power": ["on"]}, "body.power: expected string"),
+        (HDA_TOPIC, {**json.loads(SPEC_HDA_BODY), "volume": {"level": "loud", "max": "100", "min": "0", "type": "variable"}}, "body.volume.level"),
+        (HDA_TOPIC, {k: v for k, v in json.loads(SPEC_HDA_BODY).items() if k != "amp"}, "body: missing 'amp'"),
+        (HDA_TOPIC, [json.loads(SPEC_HDA_BODY)], "body is not an object"),
+        (ROOM_TOPIC, [json.loads(SPEC_ROOM_BODY)], "body is not an object"),
+        (ROOM_TOPIC, {"cur_vol": 1}, "body: missing 'zone_power'"),
+        (ROOM_TOPIC, {**json.loads(SPEC_ROOM_BODY), "mute": 2}, "body.mute: expected 0 or 1"),
     ],
 )
 def test_malformed_bodies_raise(topic, body, message):
     with pytest.raises(TelemetryParseError, match=message.replace("[", r"\[").replace("]", r"\]")):
-        parse_telemetry(topic, envelope(topic, body))
+        parse_telemetry(topic, envelope(topic, json.dumps(body)))
 
 
 def test_invalid_json_raises():
@@ -130,10 +176,9 @@ async def _publish(port: int, messages: list[tuple[str, bytes, bool]]) -> None:
 
 
 async def test_subscribe_delivers_retained_state_and_skips_malformed(broker):
-    hda = "tcsystem/global/hda/zone/3/0/"
     var = "tcsystem/global/variable_status/variable_id_7"
     # Retained state published before the subscriber connects must still arrive.
-    await _publish(broker, [(hda, envelope(hda, HDA_BODY), True)])
+    await _publish(broker, [(HDA_TOPIC, envelope(HDA_TOPIC, SPEC_HDA_BODY), True)])
 
     async def first_two():
         received = []
@@ -144,7 +189,7 @@ async def test_subscribe_delivers_retained_state_and_skips_malformed(broker):
 
     task = asyncio.create_task(first_two())
     await asyncio.sleep(0.3)
-    await _publish(broker, [(var, b"not json", False), (var, envelope(var, {"variable_type": 1, "value": "5"}), False)])
+    await _publish(broker, [(var, b"not json", False), (var, envelope(var, '{"variable_type": 1, "value": "5"}'), False)])
     hda_event, var_event = await asyncio.wait_for(task, 5)
     assert isinstance(hda_event, HdaZoneStatus) and hda_event.volume == 45
     assert var_event == VariableStatus(7, 1, "5")
