@@ -20,11 +20,12 @@ from pyurcmrx import (
 NET_STATUS_REQ = bytes.fromhex("02 02 00 e1 0f")  # §5.1
 NET_STATUS_RESP = bytes.fromhex("00 03 00 fd ff 01")
 NET_STATUS_OFFLINE_RESP = bytes.fromhex("00 03 00 fe ff 01")
-MACRO_REQ = bytes.fromhex("02 06 00 da 07 00 00 00 00")  # §5.2
+MACRO_REQ = bytes.fromhex("02 07 00 da 07 00 00 00 00 00")  # §5.2
 MACRO_ACK = bytes.fromhex("01 05 00 db 07 01 01 02")
 MACRO_FOLLOW_UP = bytes.fromhex("00 03 00 dc 07 01")
+MACRO_DISPATCHED = bytes.fromhex("00 04 00 dd 07 01 01")  # §3.1.2
 MACRO_RESP = MACRO_ACK + MACRO_FOLLOW_UP
-VOLUME_REQ = bytes.fromhex("02 15 00 ed 07 13 01 02 00 00 00 00 00 64 00 00 00 2d 00 00 00 00 00 00")  # §5.3
+VOLUME_REQ = bytes.fromhex("02 15 00 ed 07 00 13 01 02 00 00 00 00 00 64 00 00 00 2d 00 00 00 00 00")  # §5.3
 VOLUME_RESP = bytes.fromhex("00 14 00 ee 07 01 13 01 02 00 00 00 00 00 64 00 00 00 2d 00 00 00 00")
 WRONG_LENGTH_VOLUME_REQ = bytes.fromhex("02 13 00 ed 07 13 01 02 00 00 00 00 00 64 00 00 00 2d 00 00 00 00")  # §5.4
 WRONG_LENGTH_VOLUME_RESP = bytes.fromhex("01 03 00 fe ff 01")
@@ -51,7 +52,7 @@ def file_time_reply(rule_size: int) -> bytes:
 
 def test_encode_requests_match_spec_vectors():
     assert encode_request(Opcode.GET_NET_STATUS) == NET_STATUS_REQ
-    assert encode_request(Opcode.MACRO_ACTION, bytes(4)) == MACRO_REQ
+    assert encode_request(Opcode.MACRO_ACTION, bytes(5)) == MACRO_REQ
     assert encode_request(Opcode.GET_FILE_TIME) == FILE_TIME_REQ
 
 
@@ -219,11 +220,20 @@ async def test_macro_action_waits_for_follow_up_frame(serve):
             await client.macro_action(0)
 
 
-async def test_macro_action_sends_4_byte_trigger_code(serve):
+async def test_macro_action_accepts_dispatched_follow_up(serve):
+    fake = FakeController({0x07DA: MACRO_ACK + MACRO_DISPATCHED, 0x0FE6: FILE_TIME_RESP})
+    async with ControlClient("127.0.0.1", await serve(fake), timeout=1) as client:
+        assert await client.macro_action(0) is None
+        await client.get_file_time()
+    assert fake.connections == [[MACRO_REQ], [FILE_TIME_REQ]]
+
+
+async def test_macro_action_sends_prefix_then_trigger_code(serve):
+    # Without the 0x00 prefix the code's low byte is read as the prefix (spec §52 §2.1.1).
     fake = FakeController({0x07DA: MACRO_RESP})
     async with ControlClient("127.0.0.1", await serve(fake), timeout=1) as client:
-        await client.macro_action(encode_trigger_code(7, 279))
-    assert fake.requests == [bytes.fromhex("02 06 00 da 07 17 01 07 00")]
+        await client.macro_action(encode_trigger_code(7, 305))
+    assert fake.requests == [bytes.fromhex("02 07 00 da 07 00 31 01 07 00")]
 
 
 @pytest.mark.parametrize("trigger_code", [-1, 1 << 32])
@@ -281,12 +291,17 @@ async def test_set_volume_rejects_values_outside_uint32(kwargs):
 async def test_set_volume_passes_raw_device_levels(serve):
     # Volume fields are raw device-dependent values, not a 0..100 percentage (spec §52 §3.2).
     trigger_code, level, low, high = 0x00020113, 200, 10, 250
-    payload = b"".join(v.to_bytes(4, "little") for v in (trigger_code, low, high, level)) + b"\x01"
-    reply = bytes.fromhex("00 14 00 ee 07 01") + payload
+    echoed = b"".join(v.to_bytes(4, "little") for v in (trigger_code, low, high, level)) + b"\x01"
+    reply = bytes.fromhex("00 14 00 ee 07 01") + echoed
     fake = FakeController({0x07ED: reply})
     async with ControlClient("127.0.0.1", await serve(fake), timeout=1) as client:
         await client.set_volume(trigger_code, level, min_value=low, max_value=high, mute=True)
-    assert fake.requests == [encode_request(0x07ED, payload + b"\x00\x00")]
+    assert fake.requests == [encode_request(0x07ED, b"\x00" + echoed + b"\x00")]
+
+
+async def test_set_volume_rejects_button_id_bit_12():
+    with pytest.raises(ValueError, match="bit 12"):
+        await ControlClient("127.0.0.1").set_volume(encode_trigger_code(2, 0x1113), 45, min_value=0, max_value=100)
 
 
 async def test_room_power_replies(serve):

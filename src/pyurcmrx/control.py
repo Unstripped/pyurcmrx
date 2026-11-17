@@ -1,11 +1,12 @@
-"""Runtime control protocol over TCP 51510 (spec §52 v0.5.0).
+"""Runtime control protocol over TCP 51510 (spec §52 v0.6.1).
 
 Framing: `type:u8 | length:u16le | opcode:u16le | payload`, where `length` counts the
 opcode plus payload (requests) or opcode + status + body (responses); wire size is
 `length + 3`. Each connection is half-duplex: one request, then its response frames, and
 the controller never sends unsolicited frames on this socket (spec §52 §2.2). Some
-requests produce more than one response frame (MACRO_ACTION: 0x07DB then 0x07DC), so
-frames are split by `resp_length`, never assumed to be one per read or per request.
+requests produce more than one response frame (MACRO_ACTION: 0x07DB then 0x07DD or
+0x07DC), so frames are split by `resp_length`, never assumed to be one per read or per
+request.
 
 Outcome (spec §52 §2.2, §2.3): the response opcode carries the result. `0xFFFE` is a
 generic negative response that may answer any request and is a failure whatever its
@@ -33,7 +34,11 @@ FRAME_STANDARD = 0x02
 HEADER_SIZE = 3
 STATUS_SUCCESS = 0x01
 FILE_TIME_BODY_SIZE = 48  # 4-byte local timestamp + 44-byte time-zone rule
-DRAG_VOLUME_ECHO_SIZE = 17  # 0x07EE body: request offsets 0x00-0x10 (spec §52 §3.2)
+DRAG_VOLUME_ECHO_SIZE = 17  # 0x07EE body: request payload offsets 0x01-0x11 (spec §52 §3.2)
+# MACRO_ACTION and ACTION_AVR_SET_DRAG_VOLUME payloads start with this byte (spec §52 §2.1.1);
+# other values select a session-establishment path instead of the command.
+REQUEST_PREFIX = 0x00
+DRAG_VOLUME_RESERVED_BUTTON_BIT = 0x1000  # must not be set in button_id (spec §52 §3.2)
 
 
 class Opcode(IntEnum):
@@ -49,7 +54,11 @@ class Opcode(IntEnum):
     ZONE_SET_MUTE = 0x0098
     MACRO_ACTION = 0x07DA
     ACTION_ACK = 0x07DB
-    ACTION_FOLLOW_UP = 0x07DC  # second MACRO_ACTION frame; meaning not established (spec §52 §6 item 4)
+    # Second MACRO_ACTION frame: 0x07DD was observed when the action sent device commands,
+    # 0x07DC otherwise; neither is an error and the conditions are not established
+    # (spec §52 §3.1.2, §6 item 4).
+    ACTION_FOLLOW_UP = 0x07DC
+    ACTION_DISPATCHED = 0x07DD
     ACTION_AVR_SET_DRAG_VOLUME = 0x07ED
     ACTION_AVR_SET_DRAG_VOLUME_REPLY = 0x07EE
     VARIABLE_TABLE = 0x0898
@@ -224,12 +233,15 @@ class ControlClient:
             self._pending.extend(self._decoder.feed(data))
         return self._pending.pop(0)
 
-    async def request(self, opcode: int, payload: bytes, *expect: int, then: tuple[int, ...] = ()) -> Response:
+    async def request(
+        self, opcode: int, payload: bytes, *expect: int, then: tuple[tuple[int, ...], ...] = ()
+    ) -> Response:
         """Send one request and return its first response frame, whose opcode must be in `expect`.
 
-        `then` lists, in order, the opcodes of the further frames the request produces
-        (MACRO_ACTION's 0x07DC). They are read and checked before the connection is
-        released, because clients must consume every response frame (spec §52 §2.2).
+        `then` lists, in order, the allowed opcodes of each further frame the request
+        produces (MACRO_ACTION's 0x07DD or 0x07DC). They are read and checked before the
+        connection is released, because clients must consume every response frame (spec
+        §52 §2.2).
 
         A generic negative response (0xFFFE) not listed in `expect`, or any frame whose
         status is not 0x01, raises ActionRejectedError (spec §52 §2.2, §2.3). Any other
@@ -245,8 +257,8 @@ class ControlClient:
                 async with asyncio.timeout(self.timeout):
                     await self._send(frame)
                     response = _check_response(opcode, await self._read_response(), expect)
-                    for follow_up in then:
-                        _check_response(opcode, await self._read_response(), (follow_up,))
+                    for allowed in then:
+                        _check_response(opcode, await self._read_response(), allowed)
             except BaseException:
                 self._reset()
                 raise
@@ -323,15 +335,17 @@ class ControlClient:
         """Trigger a project button by its trigger code (spec §52 §3.1).
 
         `trigger_code` is a button `code` from the project model (see
-        `encode_trigger_code`). The controller answers 0x07DB then 0x07DC; neither says
-        whether the code exists, so returning means only that the request was acknowledged.
+        `encode_trigger_code`). It is sent after the 0x00 prefix byte (spec §52 §2.1.1).
+        The controller answers 0x07DB then 0x07DD or 0x07DC; none of them says whether the
+        code exists or the action ran, so returning means only that the request was
+        acknowledged (spec §52 §3.1.2).
         """
         _check_range("trigger_code", trigger_code, 32)
         await self.request(
             Opcode.MACRO_ACTION,
-            struct.pack("<I", trigger_code),
+            struct.pack("<BI", REQUEST_PREFIX, trigger_code),
             Opcode.ACTION_ACK,
-            then=(Opcode.ACTION_FOLLOW_UP,),
+            then=((Opcode.ACTION_DISPATCHED, Opcode.ACTION_FOLLOW_UP),),
         )
 
     async def set_volume(
@@ -346,10 +360,11 @@ class ControlClient:
         """Set an absolute level through a project volume control (spec §52 §3.2, `0x07ED`).
 
         `trigger_code` is `(object_id << 16) | button_id` of the project volume control;
-        `min_value`, `max_value` and `level` are raw device-dependent values, not
-        percentages. The 0x07EE reply echoes the request and is returned even for a trigger
-        code the project lacks, so returning means only that the request was acknowledged,
-        not that the level was applied.
+        bit 12 of `button_id` must be clear. `min_value`, `max_value` and `level` are raw
+        device-dependent values, not percentages. The 0x07EE reply echoes request payload
+        offsets 0x01-0x11 and is returned even for a trigger code the project lacks, so
+        returning means only that the request was acknowledged, not that the level was
+        applied.
         """
         for name, value in (
             ("trigger_code", trigger_code),
@@ -358,7 +373,11 @@ class ControlClient:
             ("max_value", max_value),
         ):
             _check_range(name, value, 32)
-        payload = struct.pack("<IIIIBH", trigger_code, min_value, max_value, level, int(mute), 0)
+        if trigger_code & DRAG_VOLUME_RESERVED_BUTTON_BIT:
+            raise ValueError("button_id bit 12 (0x1000) must not be set for 0x07ED (spec §52 §3.2)")
+        payload = struct.pack(
+            "<BIIIIBB", REQUEST_PREFIX, trigger_code, min_value, max_value, level, int(mute), 0
+        )
         response = await self.request(
             Opcode.ACTION_AVR_SET_DRAG_VOLUME, payload, Opcode.ACTION_AVR_SET_DRAG_VOLUME_REPLY
         )
@@ -366,7 +385,7 @@ class ControlClient:
             raise MalformedFrameError(
                 f"0x07EE body is {len(response.body)} bytes, need {DRAG_VOLUME_ECHO_SIZE}"
             )
-        if response.body != payload[:DRAG_VOLUME_ECHO_SIZE]:
+        if response.body != payload[1 : 1 + DRAG_VOLUME_ECHO_SIZE]:
             raise ProtocolError("0x07EE body does not echo the request")
 
     async def room_power_off(self, room_id: int) -> None:
