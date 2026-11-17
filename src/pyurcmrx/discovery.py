@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import socket
 import struct
 import sys
@@ -18,6 +19,8 @@ OPCODE_FIND = 0xC350
 OPCODE_FIND_ACK = 0xC353
 MODEL_WILDCARD = 0x0FFF
 FIND_ACK_SIZE = 55
+
+_LOGGER = logging.getLogger(__name__)
 
 # Interface flags (identical on Linux and the BSDs) and the SIOCGIFFLAGS request that reads them.
 _IFF_BROADCAST = 0x2
@@ -121,8 +124,8 @@ class _DiscoveryProtocol(asyncio.DatagramProtocol):
             self.found[controller.mac] = controller
 
     def error_received(self, exc: OSError) -> None:
-        # asyncio reports a failed sendto here instead of raising it, immediately or,
-        # for a queued datagram, on a later loop iteration.
+        # asyncio reports a failed sendto here instead of raising it: synchronously inside
+        # transport.sendto() or, for a queued datagram, on a later loop iteration.
         self.send_errors.append(exc)
 
     def connection_lost(self, exc: Exception | None) -> None:
@@ -146,8 +149,12 @@ async def discover(
     so replies are read on the socket that sent it; `bind_port = 0` picks an ephemeral
     port. Results are de-duplicated by MAC address.
 
-    Raises OSError when no probe could be sent (e.g. no route to any target), rather
-    than reporting that no controller answered.
+    A target whose probe cannot be sent is logged at WARNING with its address and the
+    OSError, and the remaining targets are still probed, so controllers on working
+    interfaces are returned. A failure that asyncio reports after queueing the datagram
+    carries no address and is logged at WARNING as unattributed. Raises OSError when
+    every probe failed (e.g. no route to any target), rather than reporting that no
+    controller answered.
     """
     targets = [target] if target is not None else subnet_broadcast_addresses()
     if not targets:
@@ -166,9 +173,17 @@ async def discover(
     try:
         probe = build_probe(seq)
         for address in targets:
+            # An immediate failure lands in send_errors before sendto() returns, and nothing
+            # else can append to it until the next await, so new entries belong to `address`.
+            errors_before = len(protocol.send_errors)
             transport.sendto(probe, (address, target_port))
-        if len(protocol.send_errors) < len(targets):
+            for exc in protocol.send_errors[errors_before:]:
+                _LOGGER.warning("discovery probe to %s:%d failed: %s", address, target_port, exc)
+        attributed = len(protocol.send_errors)
+        if attributed < len(targets):
             await asyncio.sleep(timeout)
+        for exc in protocol.send_errors[attributed:]:
+            _LOGGER.warning("a queued discovery probe failed (target unknown): %s", exc)
         if len(protocol.send_errors) >= len(targets):
             raise protocol.send_errors[0]
     finally:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import logging
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
@@ -132,6 +133,8 @@ def main() -> None:
     p.set_defaults(run=_watch)
 
     args = parser.parse_args()
+    # Library warnings (e.g. a discovery probe that could not be sent) go to stderr.
+    logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(name)s: %(message)s")
     try:
         asyncio.run(args.run(args))
     except KeyboardInterrupt:

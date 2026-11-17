@@ -1,4 +1,6 @@
 import asyncio
+import errno
+import logging
 import socket
 from ipaddress import IPv4Address
 
@@ -106,15 +108,46 @@ def failing_protocol(failures: int) -> type[discovery._DiscoveryProtocol]:
     return Failing
 
 
-async def test_discover_survives_a_failed_interface(monkeypatch):
+async def test_discover_survives_a_failed_interface(monkeypatch, caplog):
     transport, sources = await start_responder()
     monkeypatch.setattr(discovery, "subnet_broadcast_addresses", lambda: ["127.0.0.1", "127.0.0.1"])
     monkeypatch.setattr(discovery, "_DiscoveryProtocol", failing_protocol(1))
     try:
-        found = await discover(0.2, target_port=transport.get_extra_info("sockname")[1])
+        with caplog.at_level(logging.WARNING, logger="pyurcmrx.discovery"):
+            found = await discover(0.2, target_port=transport.get_extra_info("sockname")[1])
     finally:
         transport.close()
     assert [c.mac for c in found] == ["02:00:00:00:00:01"]
+    assert [r.getMessage() for r in caplog.records] == [
+        "a queued discovery probe failed (target unknown): [Errno 65] No route to host"
+    ]
+
+
+async def test_discover_reports_unreachable_interface_and_returns_the_others(monkeypatch, caplog):
+    """The LAN broadcast fails at once (as with EHOSTUNREACH on en0) while another interface works."""
+    unreachable = "192.0.2.255"
+
+    class Socket(socket.socket):
+        def sendto(self, data, *args):
+            if args[-1][0] == unreachable:
+                raise OSError(errno.EHOSTUNREACH, "No route to host")
+            return super().sendto(data, *args)
+
+    transport, sources = await start_responder()
+    port = transport.get_extra_info("sockname")[1]
+    monkeypatch.setattr(discovery, "subnet_broadcast_addresses", lambda: [unreachable, "127.0.0.1"])
+    monkeypatch.setattr(discovery.socket, "socket", Socket)
+    try:
+        with caplog.at_level(logging.WARNING, logger="pyurcmrx.discovery"):
+            found = await discover(0.2, target_port=port)
+    finally:
+        transport.close()
+    assert [c.mac for c in found] == ["02:00:00:00:00:01"]
+    assert len(sources) == 1
+    [record] = caplog.records
+    assert record.levelno == logging.WARNING
+    reason = f"[Errno {errno.EHOSTUNREACH}] No route to host"
+    assert record.getMessage() == f"discovery probe to {unreachable}:{port} failed: {reason}"
 
 
 async def test_discover_raises_when_every_interface_fails(monkeypatch):
