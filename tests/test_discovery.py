@@ -1,4 +1,5 @@
 import asyncio
+import socket
 from ipaddress import IPv4Address
 
 import pytest
@@ -64,3 +65,16 @@ async def test_discover_collects_matching_seq_and_dedupes_by_mac():
     finally:
         transport.close()
     assert [c.mac for c in found] == ["00:1F:B8:00:11:22"]
+
+
+async def test_discover_raises_when_probe_cannot_be_sent():
+    with pytest.raises(OSError):
+        await discover(0.1, target="127.0.0.1", target_port=0, bind_port=0)
+
+
+async def test_discover_releases_fixed_port_before_returning():
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+    for _ in range(2):
+        assert await discover(0.05, target="127.0.0.1", target_port=port, bind_port=port) == []

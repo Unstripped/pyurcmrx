@@ -68,6 +68,8 @@ class _DiscoveryProtocol(asyncio.DatagramProtocol):
     def __init__(self, seq: int) -> None:
         self._seq = seq
         self.found: dict[str, DiscoveredController] = {}
+        self.send_error: OSError | None = None
+        self.closed: asyncio.Future[None] = asyncio.get_running_loop().create_future()
 
     def datagram_received(self, data: bytes, addr: tuple[str, int]) -> None:
         # Our own broadcast probe loops back on the shared port; it fails the opcode check.
@@ -77,6 +79,15 @@ class _DiscoveryProtocol(asyncio.DatagramProtocol):
             return
         if controller.seq == self._seq:
             self.found[controller.mac] = controller
+
+    def error_received(self, exc: OSError) -> None:
+        # asyncio reports a failed sendto here instead of raising it.
+        if self.send_error is None:
+            self.send_error = exc
+
+    def connection_lost(self, exc: Exception | None) -> None:
+        if not self.closed.done():
+            self.closed.set_result(None)
 
 
 async def discover(
@@ -90,7 +101,9 @@ async def discover(
     """Broadcast a probe and collect PACKET_FIND_ACK replies for `timeout` seconds.
 
     Controllers reply to UDP 61510 on the requester (spec §50 §2.2), so the socket
-    binds that port by default. Results are de-duplicated by MAC address.
+    binds that port by default. Results are de-duplicated by MAC address. Raises
+    OSError when the probe cannot be sent (e.g. no route to the target), rather
+    than reporting that no controller answered.
     """
     loop = asyncio.get_running_loop()
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -105,7 +118,11 @@ async def discover(
     transport, protocol = await loop.create_datagram_endpoint(lambda: _DiscoveryProtocol(seq), sock=sock)
     try:
         transport.sendto(build_probe(seq), (target, target_port))
+        if protocol.send_error is not None:
+            raise protocol.send_error
         await asyncio.sleep(timeout)
     finally:
+        # close() releases the socket on a later loop iteration; wait so the port is free on return.
         transport.close()
+        await protocol.closed
     return list(protocol.found.values())
