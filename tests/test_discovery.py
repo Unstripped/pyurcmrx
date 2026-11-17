@@ -5,6 +5,7 @@ from ipaddress import IPv4Address
 import pytest
 
 from pyurcmrx import MalformedFrameError, build_probe, discover, parse_find_ack
+from pyurcmrx import discovery
 
 
 def make_ack(seq: int = 1, mac: bytes = bytes.fromhex("001FB8001122")) -> bytes:
@@ -70,6 +71,17 @@ async def test_discover_collects_matching_seq_and_dedupes_by_mac():
 async def test_discover_raises_when_probe_cannot_be_sent():
     with pytest.raises(OSError):
         await discover(0.1, target="127.0.0.1", target_port=0, bind_port=0)
+
+
+async def test_discover_raises_when_queued_probe_fails_later(monkeypatch):
+    class DeferredFailure(discovery._DiscoveryProtocol):
+        def connection_made(self, transport):
+            # Lands after sendto returns, as when a queued datagram fails on a later iteration.
+            asyncio.get_running_loop().call_later(0.01, self.error_received, OSError(65, "No route to host"))
+
+    monkeypatch.setattr(discovery, "_DiscoveryProtocol", DeferredFailure)
+    with pytest.raises(OSError, match="No route to host"):
+        await discover(0.05, target="127.0.0.1", target_port=9, bind_port=0)
 
 
 async def test_discover_releases_fixed_port_before_returning():

@@ -81,7 +81,8 @@ class _DiscoveryProtocol(asyncio.DatagramProtocol):
             self.found[controller.mac] = controller
 
     def error_received(self, exc: OSError) -> None:
-        # asyncio reports a failed sendto here instead of raising it.
+        # asyncio reports a failed sendto here instead of raising it, immediately or,
+        # for a queued datagram, on a later loop iteration.
         if self.send_error is None:
             self.send_error = exc
 
@@ -118,9 +119,10 @@ async def discover(
     transport, protocol = await loop.create_datagram_endpoint(lambda: _DiscoveryProtocol(seq), sock=sock)
     try:
         transport.sendto(build_probe(seq), (target, target_port))
+        if protocol.send_error is None:
+            await asyncio.sleep(timeout)
         if protocol.send_error is not None:
             raise protocol.send_error
-        await asyncio.sleep(timeout)
     finally:
         # close() releases the socket on a later loop iteration; wait so the port is free on return.
         transport.close()
