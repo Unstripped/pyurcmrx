@@ -104,6 +104,19 @@ def test_jump_and_unknown_step_types_are_skipped_and_the_macro_continues():
     assert button.steps == (ButtonTrigger((9 << 16) | 530), ButtonTrigger((9 << 16) | 277))
 
 
+def test_undefined_jump_target_hard_button_is_a_no_op():
+    # §53 §3.4.6: hard button 4640 is bound to {"type": 4, "j_type": 0, "target": 9}.
+    device = {"id": 9, "name": "TV", "hard_btns": [{"id": -1, "hbtn_id": 4640, "macro": [{"type": 4, "j_type": 0, "target": 9}]}]}
+    assert parse_core_model(_model(device)).rooms[0].devices[0].buttons == ()
+
+
+def test_non_empty_vars_items_are_accepted():
+    # §53 §3.4.2: clients MUST accept any array of integers in vars.obj.items.
+    root = json.loads((FIXTURES / "core_model_spec53.json").read_bytes())
+    root["data"]["vars"]["obj"]["items"] = [1, 7, 42]
+    assert parse_core_model(json.dumps(root)) == parse_core_model((FIXTURES / "core_model_spec53.json").read_bytes())
+
+
 def test_room_menu_merges_menus_and_drops_placeholders():
     placeholder = {"id": -1, "name": "", "hidden": 1, "image": "", "macro": []}
     menu_devs = {

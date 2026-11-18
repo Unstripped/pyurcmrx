@@ -5,13 +5,16 @@ Clean-room implementation of https://github.com/Unstripped/open-control-spec.
 
 from .checksum import rotating_checksum
 from .control import (
+    ALL_AMPLIFIERS,
     CONTROL_PORT,
     ControlClient,
     ControllerTime,
     LevelReport,
+    MuteAction,
     Opcode,
     Response,
     ResponseDecoder,
+    RoomAudioControl,
     encode_request,
     encode_trigger_code,
 )
@@ -25,6 +28,7 @@ from .discovery import (
 )
 from .errors import (
     ActionRejectedError,
+    AddressRejectedError,
     CatalogUnavailableError,
     MalformedFrameError,
     ProjectParseError,
@@ -66,11 +70,13 @@ from .telemetry import (
 )
 
 __all__ = [
+    "ALL_AMPLIFIERS",
     "CONTROL_PORT",
     "DEFAULT_CLIENT_MODEL",
     "DISCOVERY_PORT",
     "MQTT_PORT",
     "ActionRejectedError",
+    "AddressRejectedError",
     "Button",
     "ButtonTrigger",
     "CatalogUnavailableError",
@@ -87,6 +93,7 @@ __all__ = [
     "MacroStep",
     "MalformedFrameError",
     "ManifestRecord",
+    "MuteAction",
     "Opcode",
     "OtherTelemetry",
     "ProjectParseError",
@@ -94,6 +101,7 @@ __all__ = [
     "Response",
     "ResponseDecoder",
     "Room",
+    "RoomAudioControl",
     "RoomPowerOff",
     "RoomZoneStatus",
     "Telemetry",

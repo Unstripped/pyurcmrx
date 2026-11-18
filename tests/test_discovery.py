@@ -38,6 +38,7 @@ def test_parse_reply_spec_vector():
     c = parse_discovery_reply(DISCOVERY_REPLY_VECTOR)
     assert (c.seq, c.model_id, c.mac, c.ip) == (1, 0x8008, "02:00:00:00:00:01", IPv4Address("192.0.2.43"))
     assert (c.description, c.model_name) == ("", "MRX-15")
+    assert (c.description_raw, c.model_name_raw) == (b"", b"MRX-15")
 
 
 def test_parse_reply_text_fields_cut_at_first_nul_then_strip_line_terminators():
@@ -45,6 +46,7 @@ def test_parse_reply_text_fields_cut_at_first_nul_then_strip_line_terminators():
     data = DISCOVERY_REPLY_VECTOR[:0x0F] + b"Main Rack \r\n\0junk".ljust(30, b"\0") + b"MRX-15\n\0X\0"
     c = parse_discovery_reply(data)
     assert (c.description, c.model_name) == ("Main Rack", "MRX-15")
+    assert c.description_raw == b"Main Rack"
 
 
 def test_parse_reply_full_width_description_has_no_terminator():
@@ -52,10 +54,18 @@ def test_parse_reply_full_width_description_has_no_terminator():
     assert parse_discovery_reply(data).description == "D" * 30
 
 
-def test_parse_reply_decodes_non_ascii_as_utf8_with_replacement():
+def test_parse_reply_decodes_non_ascii_as_utf8_and_keeps_raw_bytes():
     data = DISCOVERY_REPLY_VECTOR[:0x0F] + "Café".encode().ljust(30, b"\0") + b"MRX\xff\n".ljust(10, b"\0")
     c = parse_discovery_reply(data)
     assert (c.description, c.model_name) == ("Café", "MRX\ufffd")
+    assert (c.description_raw, c.model_name_raw) == ("Café".encode(), b"MRX\xff")
+
+
+def test_parse_reply_byte_truncated_multibyte_sequence_is_replaced_but_preserved():
+    # §2.2.1: truncation counts bytes, so a 30-byte description can end mid-character.
+    raw = b"D" * 29 + "é".encode()[:1]
+    c = parse_discovery_reply(DISCOVERY_REPLY_VECTOR[:0x0F] + raw + DISCOVERY_REPLY_VECTOR[0x2D:])
+    assert (c.description, c.description_raw) == ("D" * 29 + "\ufffd", raw)
 
 
 @pytest.mark.parametrize(

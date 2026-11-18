@@ -1,4 +1,4 @@
-"""Controller discovery over UDP 61510 (spec §50 v0.5.0)."""
+"""Controller discovery over UDP 61510 (spec §50 v0.6.0)."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ import logging
 import socket
 import struct
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from ipaddress import IPv4Address, IPv4Interface
 
 import ifaddr
@@ -40,8 +40,12 @@ class DiscoveredController:
     model_id: int
     mac: str
     ip: IPv4Address
-    description: str
+    description: str  # `description_raw` decoded as UTF-8 with replacement (a client convention)
     model_name: str
+    # The field bytes up to the first 0x00, trailing 0x0A/0x0D/ASCII whitespace removed, as the
+    # controller stored them (spec §50 §2.2.1): keep these for comparison or re-transmission.
+    description_raw: bytes = field(repr=False)
+    model_name_raw: bytes = field(repr=False)
 
 
 def build_probe(seq: int, model_id: int = MODEL_WILDCARD, reply_ip: IPv4Address | None = None) -> bytes:
@@ -58,14 +62,14 @@ def build_probe(seq: int, model_id: int = MODEL_WILDCARD, reply_ip: IPv4Address 
     return probe
 
 
-def _text_field(field: bytes) -> str:
-    """Decode a DISCOVERY_REPLY text field (spec §50 §2.2.1).
+def _text_field(raw: bytes) -> bytes:
+    """The value bytes of a DISCOVERY_REPLY text field (spec §50 §2.2.1).
 
-    Read up to the first 0x00 (or the field end), remove trailing 0x0A, 0x0D and ASCII
-    whitespace, then decode as UTF-8 with replacement; the encoding of 0x80-0xFF is not
-    established.
+    Read up to the first 0x00 (or the field end), then remove trailing 0x0A, 0x0D and ASCII
+    whitespace. The controller defines no encoding: bytes 0x80-0xFF are returned exactly as
+    stored, and byte-count truncation can leave an incomplete multibyte sequence.
     """
-    return field.split(b"\0", 1)[0].rstrip(b" \t\n\r\x0b\x0c").decode("utf-8", errors="replace")
+    return raw.split(b"\0", 1)[0].rstrip(b" \t\n\r\x0b\x0c")
 
 
 def parse_discovery_reply(data: bytes) -> DiscoveredController:
@@ -75,13 +79,17 @@ def parse_discovery_reply(data: bytes) -> DiscoveredController:
     seq, opcode, model_id = struct.unpack_from("<BHH", data, 0)
     if opcode != OPCODE_DISCOVERY_REPLY:
         raise MalformedFrameError(f"not a DISCOVERY_REPLY: opcode 0x{opcode:04X}")
+    description = _text_field(data[0x0F:0x2D])
+    model_name = _text_field(data[0x2D:0x37])
     return DiscoveredController(
         seq=seq,
         model_id=model_id,
         mac=":".join(f"{b:02X}" for b in data[0x05:0x0B]),
         ip=IPv4Address(data[0x0B:0x0F]),
-        description=_text_field(data[0x0F:0x2D]),
-        model_name=_text_field(data[0x2D:0x37]),
+        description=description.decode("utf-8", errors="replace"),
+        model_name=model_name.decode("utf-8", errors="replace"),
+        description_raw=description,
+        model_name_raw=model_name,
     )
 
 

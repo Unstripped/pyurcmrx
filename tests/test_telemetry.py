@@ -44,9 +44,9 @@ ROOM_TOPIC = "tcsystem/global/room_event/zone_status/room_id_2"
 HDA_TOPIC = "tcsystem/global/hda/zone/2/0/"
 
 
-def envelope(topic: str, body: str, time_stamp: int = 1663794348) -> bytes:
+def envelope(topic: str, body: str, time_stamp: int = 1663794348, seq: int = 0) -> bytes:
     """Spec §00 §5.2.1 envelope around a JSON body text."""
-    header = {"version": "0.0.0.0", "seq": 0, "time_stamp": time_stamp, "tree": topic}
+    header = {"version": "0.0.0.0", "seq": seq, "time_stamp": time_stamp, "tree": topic}
     return f'{{"header": {json.dumps(header)}, "body": {body}}}'.encode()
 
 
@@ -61,14 +61,55 @@ def test_room_zone_status_observed_body():
     assert event == RoomZoneStatus(2, True, 81, 0, 100, False, False)
 
 
+def test_seq_accepts_any_integer():
+    # §5.2.1: after a camera-popup event seq MAY carry a timestamp-like value.
+    t = parse_telemetry(ROOM_TOPIC, envelope(ROOM_TOPIC, SPEC_ROOM_BODY, seq=1663794300))
+    assert t.seq == 1663794300
+
+
+@pytest.mark.parametrize("raw, fixed", [(0, False), (1, True), (2, True)])
+def test_room_zone_fixed_is_any_non_zero_output_type(raw, fixed):
+    body = json.dumps({**json.loads(SPEC_ROOM_BODY), "fixed": raw})
+    assert parse_telemetry(ROOM_TOPIC, envelope(ROOM_TOPIC, body)).event.fixed is fixed
+
+
 def test_hda_zone_spec_example():
     event = parse_telemetry(HDA_TOPIC, envelope(HDA_TOPIC, SPEC_HDA_BODY)).event
     assert isinstance(event, HdaZoneStatus)
     assert (event.hda, event.zone, event.power, event.mute, event.fixed) == (2, 0, True, False, False)
     assert (event.volume, event.min_volume, event.max_volume) == (45, 0, 100)
     assert (event.amp_peak, event.amp_thermal) == ("normal", "normal")
-    assert (event.room_id, event.room_index, event.hda_id, event.zone_id) == (2, "2", "2", "z1lr")
+    assert (event.room_id, event.room_index, event.hda_id, event.zone_id) == (2, 2, "2", "z1lr")
+    assert (event.room_name, event.stereo) == ("Room", True)
+    assert (event.balance, event.bass, event.treble, event.lipsync) == (0, 0, 0, 0)
+    assert (event.eq, event.eq_custom_name) == ("Off", "Custom")
+    assert (event.ducking, event.ducking_mute, event.ducking_event_id, event.ducking_input_name) == (False, None, None, None)
+    assert (event.input_device_name, event.input_hda_id, event.input_port) == ("Source", "2", "1")
     assert event.body == json.loads(SPEC_HDA_BODY)
+
+
+def test_hda_zone_ducking_split_half_and_signed_tone():
+    # Synthetic body per the §5.2.2 presence rules: ducking members appear only while ducking.
+    body = json.loads(SPEC_HDA_BODY)
+    body.update(
+        balance="-5", treble="3", lipsync="40", stereo="mono", zoneid="z1r",
+        ducking={"status": "on", "mute": "off", "eventid": "7", "inputname": "Paging"},
+    )
+    topic = "tcsystem/global/hda/zone/2/1/"
+    event = parse_telemetry(topic, envelope(topic, json.dumps(body))).event
+    assert (event.zone, event.zone_id, event.stereo) == (1, "z1r", False)
+    assert (event.balance, event.treble, event.lipsync) == (-5, 3, 40)
+    assert (event.ducking, event.ducking_mute, event.ducking_event_id, event.ducking_input_name) == (True, False, 7, "Paging")
+
+
+def test_hda_zone_omitted_members_are_none():
+    # §5.2.2: eq is omitted for an unknown preset; no source fields for no or an unrecognised source.
+    absent = {"eq", "inputdevname", "inputhdaid", "inputhdaport", "ducking", "roomname", "stereo", "balance"}
+    body = {k: v for k, v in json.loads(SPEC_HDA_BODY).items() if k not in absent}
+    event = parse_telemetry(HDA_TOPIC, envelope(HDA_TOPIC, json.dumps(body))).event
+    assert (event.eq, event.input_device_name, event.input_hda_id, event.input_port) == (None, None, None, None)
+    assert (event.ducking, event.room_name, event.stereo, event.balance) == (None, None, None, None)
+    assert (event.eq_custom_name, event.bass) == ("Custom", 0)
 
 
 def test_room_and_hda_views_of_one_change_stay_separate():
@@ -78,15 +119,15 @@ def test_room_and_hda_views_of_one_change_stay_separate():
     assert isinstance(room.event, RoomZoneStatus) and isinstance(hda.event, HdaZoneStatus)
     assert room.event.volume == hda.event.volume == 81
     assert hda.event.room_id == room.event.room_id == 2
-    assert hda.event.body["inputdevname"] == "APPLE TV GYM"
+    assert hda.event.input_device_name == "APPLE TV GYM"
 
 
 def test_hda_zone_tolerates_unknown_values_and_extra_fields():
     body = json.loads(SPEC_HDA_BODY)
-    body.update(power="standby", extra={"x": 1}, roomid=2, amp={"peak": "clipping", "thermal": "hot"})
+    body.update(power="standby", extra={"x": 1}, roomid=2, stereo="quad", amp={"peak": "clipping", "thermal": "hot"})
     body["volume"] = {**body["volume"], "type": "stepped"}
     event = parse_telemetry(HDA_TOPIC, envelope(HDA_TOPIC, json.dumps(body))).event
-    assert (event.power, event.fixed, event.room_id) == (None, None, 2)
+    assert (event.power, event.fixed, event.stereo, event.room_id) == (None, None, None, 2)
     assert (event.amp_peak, event.amp_thermal) == ("clipping", "hot")
 
 
@@ -105,6 +146,8 @@ def test_hda_amp_status():
     topic = "tcsystem/global/hda/ampstatus/2/1/"
     event = parse_telemetry(topic, envelope(topic, SPEC_AMP_BODY)).event
     assert event == HdaAmpStatus(2, 1, "normal", "normal", "normal", "normal", "2", "1", json.loads(SPEC_AMP_BODY))
+    # §5.2.2: k = slot + 1, so ampstatus/2/1/ is the slot of hda/zone/2/0/.
+    assert event.slot == parse_telemetry(HDA_TOPIC, envelope(HDA_TOPIC, SPEC_HDA_BODY)).event.zone == 0
 
 
 def test_variable_and_link_status():
@@ -131,6 +174,10 @@ def test_empty_payload_is_a_retained_clear():
         (HDA_TOPIC, {**json.loads(SPEC_HDA_BODY), "power": ["on"]}, "body.power: expected string"),
         (HDA_TOPIC, {**json.loads(SPEC_HDA_BODY), "volume": {"level": "loud", "max": "100", "min": "0", "type": "variable"}}, "body.volume.level"),
         (HDA_TOPIC, {k: v for k, v in json.loads(SPEC_HDA_BODY).items() if k != "amp"}, "body: missing 'amp'"),
+        (HDA_TOPIC, {**json.loads(SPEC_HDA_BODY), "roomindex": "first"}, "body.roomindex: expected integer"),
+        (HDA_TOPIC, {**json.loads(SPEC_HDA_BODY), "bass": "loud"}, "body.bass: expected integer"),
+        (HDA_TOPIC, {**json.loads(SPEC_HDA_BODY), "ducking": "off"}, "body.ducking: expected an object"),
+        (HDA_TOPIC, {**json.loads(SPEC_HDA_BODY), "ducking": {"status": "on", "eventid": "x"}}, "body.ducking.eventid"),
         (HDA_TOPIC, [json.loads(SPEC_HDA_BODY)], "body is not an object"),
         (ROOM_TOPIC, [json.loads(SPEC_ROOM_BODY)], "body is not an object"),
         (ROOM_TOPIC, {"cur_vol": 1}, "body: missing 'zone_power'"),

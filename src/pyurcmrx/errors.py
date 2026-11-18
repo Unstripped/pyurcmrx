@@ -14,10 +14,16 @@ class ProtocolError(UrcMrxError):
 
 
 class ActionRejectedError(UrcMrxError):
-    """The controller rejected a request: generic negative `0xFFFE`, or status other than 0x01.
+    """The controller answered a request with a negative reply opcode (spec §52 §2.2, §2.3).
 
-    Spec §52 §2.2 and §2.3: `0xFFFE` is negative whatever its status byte, and any other
-    reply with a status other than 0x01 is treated as a failure.
+    `0xFFFE` for any request, or `0x012D` for the amplifier-zone commands. The status byte
+    never decides the outcome.
+    """
+
+
+class AddressRejectedError(ActionRejectedError):
+    """The controller did not perform a request because another connection from this client
+    address was registered, and retrying did not get through (spec §52 §4 rules 10-11).
     """
 
 

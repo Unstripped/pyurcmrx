@@ -9,8 +9,13 @@ each room, and the buttons on both. A button's macro lists steps in execution or
   (`0x07DA`) `trigger_code` (§52 §3.1);
 - type 54 turns a room off: `ROOM_POWER_OFF` (`0x000D`) with `room_id = room`.
 
-Type 4 (jump) is client-local navigation. This library has no screens, so it ignores jumps,
-and it skips every other step type, as clients MUST (§53 §3.4.4).
+Type 4 (jump) is client-local navigation, never sent to the controller (§53 §3.4.4). This
+library has no screens, so it ignores jumps, including a `j_type = 0` jump to an undefined
+`target` above 8 such as hard button 4640's `target = 9`, which clients MUST treat as a
+no-op. It skips every other step type, as clients MUST, and continues with the next step.
+
+`data.vars` is not read: `vars.obj.items` is an array of bare integers whose meaning is not
+established, and clients SHOULD NOT depend on it (§53 §3.4.2).
 """
 
 from __future__ import annotations
@@ -21,7 +26,9 @@ from typing import Any
 
 from .errors import ProjectParseError
 
-STEP_JUMP = 4  # {"type": 4, "j_type": ..., "target": ...}: client-local UI navigation
+# {"type": 4, "j_type": ..., "target": ...}: client-local UI navigation. j_type 0 default,
+# 1 page, 2 device, 3 sub-menu, 4 special screen; j_type 0 targets above 8 are undefined.
+STEP_JUMP = 4
 STEP_BUTTON_TRIGGER = 33  # {"type": 33, "code": (object_id << 16) | button_id}
 STEP_ROOM_POWER_OFF = 54  # {"type": 54, "room": room_id}
 
@@ -80,7 +87,8 @@ class Device:
 
 @dataclass(frozen=True, slots=True)
 class Room:
-    id: int  # room_id for TCP 51510 room power (0x000D/0x0012) and MQTT zone_status
+    # room_id for TCP 51510 ROOM_POWER_OFF (0x000D) / POWER_MENU_QUERY (0x0012) and MQTT zone_status
+    id: int
     name: str
     menu: tuple[Button, ...]  # room menu (menu_devs) hard buttons and tiles
     devices: tuple[Device, ...]
