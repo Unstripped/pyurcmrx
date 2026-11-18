@@ -54,8 +54,13 @@ async def _macro(args: argparse.Namespace) -> None:
     else:
         raise SystemExit("macro needs either TRIGGER_CODE or both --object and --button")
     async with ControlClient(args.host) as client:
-        await client.macro_action(code)
-        print("acknowledged")
+        report = await client.macro_action(code)
+    print("acknowledged")
+    if report is not None:
+        # Last level report of the action (spec §52 §3.1.3).
+        print(f"level {report.level} ({report.min_level}..{report.max_level})")
+        if report.mute:
+            print("muted")
 
 
 async def _volume(args: argparse.Namespace) -> None:
@@ -67,7 +72,8 @@ async def _volume(args: argparse.Namespace) -> None:
 
 
 def _print_reply(reply: Response | None) -> None:
-    # The success reply for room/zone audio is not established (spec §52 §3.11): show it raw.
+    # Room/zone audio has not been observed to succeed, so its success reply is not
+    # established (spec §52 §3.11, §6 item 5): show it raw.
     if reply is None:
         print("no reply")
     else:
@@ -156,42 +162,51 @@ def main() -> None:
     p.add_argument("host")
     p.set_defaults(run=_variables)
 
-    p = sub.add_parser("macro", help="trigger a project button with MACRO_ACTION (0x07DA)")
+    p = sub.add_parser("macro", help="trigger a project button with MACRO_TRIGGER (0x07DA)")
     p.add_argument("host")
     p.add_argument("trigger_code", type=int, nargs="?", help="button code from the catalog")
     p.add_argument("--object", type=int, help="UI object id; with --button, instead of TRIGGER_CODE")
     p.add_argument("--button", type=int, help="button id; with --object, instead of TRIGGER_CODE")
     p.set_defaults(run=_macro)
 
-    p = sub.add_parser("volume", help="set an absolute level through a project volume control (0x07ED)")
+    p = sub.add_parser(
+        "volume",
+        help="set an absolute level with SET_LEVEL_ABSOLUTE (0x07ED); no accepting trigger is known, "
+        "use only a trigger confirmed against the device, otherwise step volume with macro",
+    )
     p.add_argument("host")
-    p.add_argument("trigger_code", type=int, help="trigger code of the project volume control")
+    p.add_argument("trigger_code", type=int, help="trigger code resolving to a connected-device binding")
     p.add_argument("level", type=int, help="raw device-dependent level")
     p.add_argument("--min", dest="min_value", type=int, required=True, help="raw minimum of the control")
     p.add_argument("--max", dest="max_value", type=int, required=True, help="raw maximum of the control")
     p.add_argument("--mute", action="store_true")
     p.set_defaults(run=_volume)
 
-    p = sub.add_parser("room-volume", help="set a room's audio zone level (0x007D)")
+    p = sub.add_parser("room-volume", help="set a room's audio zone level (0x007D; not observed to succeed)")
     p.add_argument("host")
     p.add_argument("room", type=int, help="room id")
     p.add_argument("value", type=int, help="raw zone level")
     p.set_defaults(run=_room_volume)
 
-    p = sub.add_parser("room-mute", help="mute or unmute a room's audio zone (0x007E)")
+    p = sub.add_parser("room-mute", help="mute or unmute a room's audio zone (0x007E; not observed to succeed)")
     p.add_argument("host")
     p.add_argument("room", type=int, help="room id")
     p.add_argument("state", choices=_ON_OFF)
     p.set_defaults(run=_room_mute)
 
-    p = sub.add_parser("zone-volume", help="set one zone of a connected audio device (0x0097)")
+    p = sub.add_parser(
+        "zone-volume", help="set one zone of a connected audio device (0x0097; not observed to succeed)"
+    )
     p.add_argument("host")
     p.add_argument("con_dev", type=int, help="connected-device id (mcs.dat)")
     p.add_argument("zone", type=int, help="zone index")
     p.add_argument("value", type=int, help="raw zone level")
     p.set_defaults(run=_zone_volume)
 
-    p = sub.add_parser("zone-mute", help="mute or unmute one zone of a connected audio device (0x0098)")
+    p = sub.add_parser(
+        "zone-mute",
+        help="mute or unmute one zone of a connected audio device (0x0098; not observed to succeed)",
+    )
     p.add_argument("host")
     p.add_argument("con_dev", type=int, help="connected-device id (mcs.dat)")
     p.add_argument("zone", type=int, help="zone index")

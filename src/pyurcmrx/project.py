@@ -5,9 +5,9 @@
 each room, and the buttons on both. A button's macro lists steps in execution order
 (§53 §3.4.4); this library implements the two step types that reach the controller:
 
-- type 33 triggers a controller-side button: its `code` is sent as the `MACRO_ACTION`
+- type 33 triggers a controller-side button: its `code` is sent as the `MACRO_TRIGGER`
   (`0x07DA`) `trigger_code` (§52 §3.1);
-- type 54 turns a room off: `ROOMS_CMD_ROOM_POWER_OFF` (`0x000D`) with `room_id = room`.
+- type 54 turns a room off: `ROOM_POWER_OFF` (`0x000D`) with `room_id = room`.
 
 Type 4 (jump) is client-local navigation. This library has no screens, so it ignores jumps,
 and it skips every other step type, as clients MUST (§53 §3.4.4).
@@ -31,7 +31,7 @@ HARD_BUTTON_LABELS = {275: "Vol+", 276: "Vol-", 277: "Mute", 4624: "Power"}
 
 @dataclass(frozen=True, slots=True)
 class ButtonTrigger:
-    """A controller-side button; send `trigger_code` with `MACRO_ACTION` (spec §52 §3.1).
+    """A controller-side button; send `trigger_code` with `MACRO_TRIGGER` (spec §52 §3.1).
 
     The code is opaque to clients (§53 §3.4.4): `object_id` is a project UI object id, not
     a connected-device id, and `button_id` is only by convention a device function id.
@@ -50,7 +50,7 @@ class ButtonTrigger:
 
 @dataclass(frozen=True, slots=True)
 class RoomPowerOff:
-    """Send `ROOMS_CMD_ROOM_POWER_OFF` (`0x000D`) with this room id (spec §53 §3.4.4)."""
+    """Send `ROOM_POWER_OFF` (`0x000D`) with this room id (spec §53 §3.4.4)."""
 
     room_id: int
 

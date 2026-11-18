@@ -8,6 +8,7 @@ from .control import (
     CONTROL_PORT,
     ControlClient,
     ControllerTime,
+    LevelReport,
     Opcode,
     Response,
     ResponseDecoder,
@@ -19,7 +20,7 @@ from .discovery import (
     DiscoveredController,
     build_probe,
     discover,
-    parse_find_ack,
+    parse_discovery_reply,
     subnet_broadcast_addresses,
 )
 from .errors import (
@@ -81,6 +82,7 @@ __all__ = [
     "HdaAmpStatus",
     "HdaInputStatus",
     "HdaZoneStatus",
+    "LevelReport",
     "LinkStatus",
     "MacroStep",
     "MalformedFrameError",
@@ -105,7 +107,7 @@ __all__ = [
     "encode_trigger_code",
     "fetch_core_model",
     "parse_core_model",
-    "parse_find_ack",
+    "parse_discovery_reply",
     "parse_manifest",
     "parse_telemetry",
     "rotating_checksum",

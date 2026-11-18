@@ -21,7 +21,7 @@ from .project import CoreModel, parse_core_model
 
 FTP_PORT = 21
 UPDATEROOT_DIR = "updateroot"
-# iPhone client model; its manifest names the T0002 copy in the reference (spec §20 §4.3).
+# iPhone client model; its manifest names the T0002 copy in a typical installation (spec §20 §4.3).
 DEFAULT_CLIENT_MODEL = "E207"
 CLIENT_MODEL = re.compile(r"^[0-9A-F]{4}$")
 CORE_MODEL_NAME = re.compile(r"^T(?P<template>\d{4})_A0{16}_C(?P<checksum>[0-9A-F]{8})_core_model\.json$")

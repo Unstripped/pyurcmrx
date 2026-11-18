@@ -1,4 +1,4 @@
-"""MQTT state telemetry from the controller's broker (spec §00 §5.2, v0.5.1).
+"""MQTT state telemetry from the controller's broker (spec §00 §5.2, v0.6.0).
 
 The broker (TCP 1883, anonymous) is publish-only from the controller: it reports state
 but never accepts commands. Every message is a JSON envelope `{"header": {...}, "body":

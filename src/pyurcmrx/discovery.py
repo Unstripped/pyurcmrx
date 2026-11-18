@@ -1,4 +1,4 @@
-"""Controller discovery over UDP 61510 (spec §50 v0.4.0)."""
+"""Controller discovery over UDP 61510 (spec §50 v0.5.0)."""
 
 from __future__ import annotations
 
@@ -15,10 +15,10 @@ import ifaddr
 from .errors import MalformedFrameError
 
 DISCOVERY_PORT = 61510
-OPCODE_FIND = 0xC350
-OPCODE_FIND_ACK = 0xC353
+OPCODE_DISCOVERY_PROBE = 0xC350
+OPCODE_DISCOVERY_REPLY = 0xC353
 MODEL_WILDCARD = 0x0FFF
-FIND_ACK_SIZE = 55
+DISCOVERY_REPLY_SIZE = 55
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -45,21 +45,21 @@ class DiscoveredController:
 
 
 def build_probe(seq: int, model_id: int = MODEL_WILDCARD, reply_ip: IPv4Address | None = None) -> bytes:
-    """Build a PACKET_FIND probe (spec §50 §2.1).
+    """Build a DISCOVERY_PROBE probe (spec §50 §2.1).
 
     5 bytes, answered with a broadcast to 255.255.255.255; or 9 bytes when `reply_ip` is
     given, answered with a unicast to that address (spec §50 §2.3). A `model_id` whose low
     12 bits are 0xFFF is a wildcard; any other value must equal the controller's model
     identifier exactly, otherwise the controller ignores the probe.
     """
-    probe = struct.pack("<BHH", seq & 0xFF, OPCODE_FIND, model_id)
+    probe = struct.pack("<BHH", seq & 0xFF, OPCODE_DISCOVERY_PROBE, model_id)
     if reply_ip is not None:
         probe += reply_ip.packed
     return probe
 
 
 def _text_field(field: bytes) -> str:
-    """Decode a PACKET_FIND_ACK text field (spec §50 §2.2.1).
+    """Decode a DISCOVERY_REPLY text field (spec §50 §2.2.1).
 
     Read up to the first 0x00 (or the field end), remove trailing 0x0A, 0x0D and ASCII
     whitespace, then decode as UTF-8 with replacement; the encoding of 0x80-0xFF is not
@@ -68,13 +68,13 @@ def _text_field(field: bytes) -> str:
     return field.split(b"\0", 1)[0].rstrip(b" \t\n\r\x0b\x0c").decode("utf-8", errors="replace")
 
 
-def parse_find_ack(data: bytes) -> DiscoveredController:
-    """Parse a 55-byte PACKET_FIND_ACK datagram (spec §50 §2.2)."""
-    if len(data) != FIND_ACK_SIZE:
-        raise MalformedFrameError(f"PACKET_FIND_ACK is {len(data)} bytes, need {FIND_ACK_SIZE}")
+def parse_discovery_reply(data: bytes) -> DiscoveredController:
+    """Parse a 55-byte DISCOVERY_REPLY datagram (spec §50 §2.2)."""
+    if len(data) != DISCOVERY_REPLY_SIZE:
+        raise MalformedFrameError(f"DISCOVERY_REPLY is {len(data)} bytes, need {DISCOVERY_REPLY_SIZE}")
     seq, opcode, model_id = struct.unpack_from("<BHH", data, 0)
-    if opcode != OPCODE_FIND_ACK:
-        raise MalformedFrameError(f"not a PACKET_FIND_ACK: opcode 0x{opcode:04X}")
+    if opcode != OPCODE_DISCOVERY_REPLY:
+        raise MalformedFrameError(f"not a DISCOVERY_REPLY: opcode 0x{opcode:04X}")
     return DiscoveredController(
         seq=seq,
         model_id=model_id,
@@ -129,7 +129,7 @@ class _DiscoveryProtocol(asyncio.DatagramProtocol):
 
     def datagram_received(self, data: bytes, addr: tuple[str, int]) -> None:
         try:
-            controller = parse_find_ack(data)
+            controller = parse_discovery_reply(data)
         except MalformedFrameError:
             return
         if controller.seq == self._seq:
@@ -153,7 +153,7 @@ async def discover(
     target_port: int = DISCOVERY_PORT,
     bind_port: int = 0,
 ) -> list[DiscoveredController]:
-    """Send a 5-byte PACKET_FIND and collect PACKET_FIND_ACK replies for `timeout` seconds.
+    """Send a 5-byte DISCOVERY_PROBE and collect DISCOVERY_REPLY replies for `timeout` seconds.
 
     The probe goes to `target` (a controller's unicast address, a subnet-directed
     broadcast address, or 255.255.255.255; all confirmed, spec §50 §2.3, §4.1), or by

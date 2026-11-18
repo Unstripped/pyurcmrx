@@ -7,12 +7,12 @@ from ipaddress import IPv4Address
 import ifaddr
 import pytest
 
-from pyurcmrx import DISCOVERY_PORT, MalformedFrameError, build_probe, discover, parse_find_ack, subnet_broadcast_addresses
+from pyurcmrx import DISCOVERY_PORT, MalformedFrameError, build_probe, discover, parse_discovery_reply, subnet_broadcast_addresses
 from pyurcmrx import discovery
 
 # Spec §50 §4.1 wildcard request and §4.2 sanitized example response, verbatim.
-FIND_VECTOR = bytes.fromhex("01 50 C3 FF 0F")
-FIND_ACK_VECTOR = bytes.fromhex(
+DISCOVERY_PROBE_VECTOR = bytes.fromhex("01 50 C3 FF 0F")
+DISCOVERY_REPLY_VECTOR = bytes.fromhex(
     "01 53 C3 08 80 02 00 00 00 00 01 C0 00 02 2B 00"
     "00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00"
     "00 00 00 00 00 00 00 00 00 00 00 00 00 4D 52 58"
@@ -20,52 +20,52 @@ FIND_ACK_VECTOR = bytes.fromhex(
 )
 
 
-def make_ack(seq: int = 1, mac: bytes = bytes.fromhex("020000000001")) -> bytes:
+def make_reply(seq: int = 1, mac: bytes = bytes.fromhex("020000000001")) -> bytes:
     """The §4.2 vector with a different sequence number and MAC."""
-    return bytes([seq]) + FIND_ACK_VECTOR[1:5] + mac + FIND_ACK_VECTOR[11:]
+    return bytes([seq]) + DISCOVERY_REPLY_VECTOR[1:5] + mac + DISCOVERY_REPLY_VECTOR[11:]
 
 
 def test_probe_matches_spec_vector():
-    assert build_probe(1) == FIND_VECTOR
+    assert build_probe(1) == DISCOVERY_PROBE_VECTOR
     assert build_probe(1) != bytes.fromhex("01 C3 50 FF 0F")  # byte-swapped form controllers ignore
 
 
 def test_routed_probe_appends_reply_address():
-    assert build_probe(1, reply_ip=IPv4Address("192.0.2.10")) == FIND_VECTOR + bytes.fromhex("C0 00 02 0A")
+    assert build_probe(1, reply_ip=IPv4Address("192.0.2.10")) == DISCOVERY_PROBE_VECTOR + bytes.fromhex("C0 00 02 0A")
 
 
-def test_parse_ack_spec_vector():
-    c = parse_find_ack(FIND_ACK_VECTOR)
+def test_parse_reply_spec_vector():
+    c = parse_discovery_reply(DISCOVERY_REPLY_VECTOR)
     assert (c.seq, c.model_id, c.mac, c.ip) == (1, 0x8008, "02:00:00:00:00:01", IPv4Address("192.0.2.43"))
     assert (c.description, c.model_name) == ("", "MRX-15")
 
 
-def test_parse_ack_text_fields_cut_at_first_nul_then_strip_line_terminators():
+def test_parse_reply_text_fields_cut_at_first_nul_then_strip_line_terminators():
     # §2.2.1: the description line keeps its 0x0A; bytes after the first 0x00 are ignored.
-    data = FIND_ACK_VECTOR[:0x0F] + b"Main Rack \r\n\0junk".ljust(30, b"\0") + b"MRX-15\n\0X\0"
-    c = parse_find_ack(data)
+    data = DISCOVERY_REPLY_VECTOR[:0x0F] + b"Main Rack \r\n\0junk".ljust(30, b"\0") + b"MRX-15\n\0X\0"
+    c = parse_discovery_reply(data)
     assert (c.description, c.model_name) == ("Main Rack", "MRX-15")
 
 
-def test_parse_ack_full_width_description_has_no_terminator():
-    data = FIND_ACK_VECTOR[:0x0F] + b"D" * 30 + FIND_ACK_VECTOR[0x2D:]
-    assert parse_find_ack(data).description == "D" * 30
+def test_parse_reply_full_width_description_has_no_terminator():
+    data = DISCOVERY_REPLY_VECTOR[:0x0F] + b"D" * 30 + DISCOVERY_REPLY_VECTOR[0x2D:]
+    assert parse_discovery_reply(data).description == "D" * 30
 
 
-def test_parse_ack_decodes_non_ascii_as_utf8_with_replacement():
-    data = FIND_ACK_VECTOR[:0x0F] + "Café".encode().ljust(30, b"\0") + b"MRX\xff\n".ljust(10, b"\0")
-    c = parse_find_ack(data)
+def test_parse_reply_decodes_non_ascii_as_utf8_with_replacement():
+    data = DISCOVERY_REPLY_VECTOR[:0x0F] + "Café".encode().ljust(30, b"\0") + b"MRX\xff\n".ljust(10, b"\0")
+    c = parse_discovery_reply(data)
     assert (c.description, c.model_name) == ("Café", "MRX\ufffd")
 
 
 @pytest.mark.parametrize(
     "data",
-    [FIND_VECTOR, FIND_ACK_VECTOR[:-1], FIND_ACK_VECTOR + bytes(40), FIND_ACK_VECTOR[:1] + b"\xc3\x53" + FIND_ACK_VECTOR[3:]],
+    [DISCOVERY_PROBE_VECTOR, DISCOVERY_REPLY_VECTOR[:-1], DISCOVERY_REPLY_VECTOR + bytes(40), DISCOVERY_REPLY_VECTOR[:1] + b"\xc3\x53" + DISCOVERY_REPLY_VECTOR[3:]],
     ids=["own_probe", "54_bytes", "95_bytes", "byte_swapped_opcode"],
 )
-def test_parse_rejects_non_ack(data):
+def test_parse_rejects_non_reply(data):
     with pytest.raises(MalformedFrameError):
-        parse_find_ack(data)
+        parse_discovery_reply(data)
 
 
 async def start_responder() -> tuple[asyncio.DatagramTransport, list[tuple[str, int]]]:
@@ -79,9 +79,9 @@ async def start_responder() -> tuple[asyncio.DatagramTransport, list[tuple[str, 
         def datagram_received(self, data, addr):
             sources.append(addr)
             seq = data[0]
-            self.transport.sendto(make_ack(seq), addr)
-            self.transport.sendto(make_ack(seq), addr)  # duplicate reply
-            self.transport.sendto(make_ack(seq + 1, mac=bytes(6)), addr)  # stale sequence
+            self.transport.sendto(make_reply(seq), addr)
+            self.transport.sendto(make_reply(seq), addr)  # duplicate reply
+            self.transport.sendto(make_reply(seq + 1, mac=bytes(6)), addr)  # stale sequence
 
     transport, _ = await asyncio.get_running_loop().create_datagram_endpoint(Responder, local_addr=("127.0.0.1", 0))
     return transport, sources

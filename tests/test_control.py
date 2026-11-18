@@ -7,6 +7,7 @@ from pyurcmrx import (
     ActionRejectedError,
     ControlClient,
     ControllerTime,
+    LevelReport,
     MalformedFrameError,
     Opcode,
     ProtocolError,
@@ -22,9 +23,11 @@ NET_STATUS_RESP = bytes.fromhex("00 03 00 fd ff 01")
 NET_STATUS_OFFLINE_RESP = bytes.fromhex("00 03 00 fe ff 01")
 MACRO_REQ = bytes.fromhex("02 07 00 da 07 00 00 00 00 00")  # §5.2
 MACRO_ACK = bytes.fromhex("01 05 00 db 07 01 01 02")
-MACRO_FOLLOW_UP = bytes.fromhex("00 03 00 dc 07 01")
-MACRO_DISPATCHED = bytes.fromhex("00 04 00 dd 07 01 01")  # §3.1.2
-MACRO_RESP = MACRO_ACK + MACRO_FOLLOW_UP
+MACRO_DONE = bytes.fromhex("00 03 00 dc 07 01")
+MACRO_RESP = MACRO_ACK + MACRO_DONE
+ACTION_START = bytes.fromhex("00 04 00 dd 07 01 01")  # §3.1.2
+ACTION_END = bytes.fromhex("00 04 00 dd 07 01 00")
+LEVEL_REPORT_RESERVED = bytes.fromhex("02 00 00 00 01 00 00")  # §3.1.3, observed in every report
 VOLUME_REQ = bytes.fromhex("02 15 00 ed 07 00 13 01 02 00 00 00 00 00 64 00 00 00 2d 00 00 00 00 00")  # §5.3
 VOLUME_RESP = bytes.fromhex("00 14 00 ee 07 01 13 01 02 00 00 00 00 00 64 00 00 00 2d 00 00 00 00")
 WRONG_LENGTH_VOLUME_REQ = bytes.fromhex("02 13 00 ed 07 13 01 02 00 00 00 00 00 64 00 00 00 2d 00 00 00 00")  # §5.4
@@ -40,9 +43,15 @@ FIRST_REQUEST_DEADLINE_RESP = bytes.fromhex("01 03 00 fe ff 01")  # §5.8
 ROOM_POWER_OFF_RESP = bytes.fromhex("00 03 00 0F 00 01")  # §3.3
 ROOM_POWER_ON_RESP = bytes.fromhex("00 07 00 14 00 01 00 00 00 00")  # §3.5, unknown room
 ROOM_AUDIO_UNKNOWN_ROOM_RESP = bytes.fromhex("00 03 00 FE FF 02")  # §3.11
-VARIABLES_REQ = encode_request(Opcode.VARIABLE_CMD_GET_TABLE)
-HOUSE_OFF_REQ = encode_request(Opcode.ROOMS_CMD_HOUSE_OFF)
+VARIABLES_REQ = encode_request(Opcode.VARIABLE_TABLE_QUERY)
+HOUSE_OFF_REQ = encode_request(Opcode.HOUSE_OFF)
 EMPTY_VARIABLE_TABLE = bytes.fromhex("00 07 00 98 08 01 00 00 00 00")
+
+
+def level_report(level: int, mute: int = 0, body_tail: bytes = LEVEL_REPORT_RESERVED) -> bytes:
+    # §3.1.3: `00 0E 00 E1 07 01` + min_level 0, max_level 100, level, mute, 7 reserved bytes.
+    body = bytes([0x00, 0x64, level, mute]) + body_tail
+    return b"\x00" + (3 + len(body)).to_bytes(2, "little") + (0x07E1).to_bytes(2, "little") + b"\x01" + body
 
 
 def file_time_reply(rule_size: int) -> bytes:
@@ -51,9 +60,9 @@ def file_time_reply(rule_size: int) -> bytes:
 
 
 def test_encode_requests_match_spec_vectors():
-    assert encode_request(Opcode.GET_NET_STATUS) == NET_STATUS_REQ
-    assert encode_request(Opcode.MACRO_ACTION, bytes(5)) == MACRO_REQ
-    assert encode_request(Opcode.GET_FILE_TIME) == FILE_TIME_REQ
+    assert encode_request(Opcode.NETWORK_STATUS_QUERY) == NET_STATUS_REQ
+    assert encode_request(Opcode.MACRO_TRIGGER, bytes(5)) == MACRO_REQ
+    assert encode_request(Opcode.CONTROLLER_TIME_QUERY) == FILE_TIME_REQ
 
 
 def test_encode_trigger_code_matches_spec_example():
@@ -203,29 +212,101 @@ async def test_net_status_with_failure_status_raises(serve):
             await client.get_net_status()
 
 
-async def test_macro_action_reads_both_frames_across_segments(serve):
-    fake = FakeController({0x07DA: [MACRO_ACK, MACRO_FOLLOW_UP], 0x0FE6: FILE_TIME_RESP})
+async def test_macro_action_trigger_code_zero_reads_both_frames_across_segments(serve):
+    # Spec §52 §5.2: no action, so 0x07DC follows 0x07DB directly and no level is reported.
+    fake = FakeController({0x07DA: [MACRO_ACK, MACRO_DONE], 0x0FE6: FILE_TIME_RESP})
     async with ControlClient("127.0.0.1", await serve(fake), timeout=1) as client:
-        await client.macro_action(0)
-        # The follow-up frame was consumed, so it cannot answer the next request.
+        assert await client.macro_action(0) is None
+        # The 0x07DC frame was consumed, so it cannot answer the next request.
         await client.get_file_time()
     assert fake.connections == [[MACRO_REQ], [FILE_TIME_REQ]]
 
 
-async def test_macro_action_waits_for_follow_up_frame(serve):
-    # Every response frame must be consumed (spec §52 §2.2); the ACK alone is not the end.
-    fake = FakeController({0x07DA: MACRO_ACK})
+async def test_macro_action_reads_action_sequence_until_done(serve):
+    # Spec §52 §3.1.2: 0x07DB, 0x07DD `01`, 0x07DD `00`, 0x07DC; no level reports.
+    reply = [MACRO_ACK, ACTION_START, ACTION_END, MACRO_DONE]
+    fake = FakeController({0x07DA: reply, 0x0FE6: FILE_TIME_RESP})
+    async with ControlClient("127.0.0.1", await serve(fake), timeout=1) as client:
+        assert await client.macro_action(0) is None
+        await client.get_file_time()
+    assert fake.connections == [[MACRO_REQ], [FILE_TIME_REQ]]
+
+
+async def test_macro_action_returns_last_level_report(serve):
+    # Spec §52 §3.1.3: clients SHOULD take the level from the last report in the sequence.
+    reply = ACTION_START + level_report(0x3F) + level_report(0x3D) + ACTION_END + MACRO_DONE
+    fake = FakeController({0x07DA: MACRO_ACK + reply})
+    async with ControlClient("127.0.0.1", await serve(fake), timeout=1) as client:
+        report = await client.macro_action(0)
+    assert report == LevelReport(min_level=0, max_level=100, level=0x3D, mute=False, reserved=LEVEL_REPORT_RESERVED)
+    assert "reserved" not in repr(report)
+
+
+async def test_macro_action_decodes_muted_report(serve):
+    reply = MACRO_ACK + ACTION_START + level_report(0x3D, mute=1) + ACTION_END + MACRO_DONE
+    fake = FakeController({0x07DA: reply})
+    async with ControlClient("127.0.0.1", await serve(fake), timeout=1) as client:
+        report = await client.macro_action(0)
+    assert (report.level, report.mute) == (0x3D, True)
+
+
+async def test_macro_action_handles_frames_split_across_segments(serve):
+    sequence = MACRO_ACK + ACTION_START + level_report(0x3F) + level_report(0x3D) + ACTION_END + MACRO_DONE
+    chunks = [sequence[i : i + 5] for i in range(0, len(sequence), 5)]
+    fake = FakeController({0x07DA: chunks, 0x0FE6: FILE_TIME_RESP})
+    async with ControlClient("127.0.0.1", await serve(fake), timeout=2) as client:
+        assert (await client.macro_action(0)).level == 0x3D
+        await client.get_file_time()
+    assert fake.connections == [[MACRO_REQ], [FILE_TIME_REQ]]
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [
+        MACRO_ACK,
+        MACRO_ACK + ACTION_START + level_report(0x3D) + ACTION_END,
+    ],
+    ids=["ack_only", "no_done_after_action_end"],
+)
+async def test_macro_action_waits_for_trigger_done(serve, reply):
+    # Clients MUST keep reading until 0x07DC (spec §52 §3.1.2); neither 0x07DB nor 0x07DD ends it.
+    fake = FakeController({0x07DA: reply})
     async with ControlClient("127.0.0.1", await serve(fake), timeout=0.2) as client:
         with pytest.raises(TimeoutError):
             await client.macro_action(0)
 
 
-async def test_macro_action_accepts_dispatched_follow_up(serve):
-    fake = FakeController({0x07DA: MACRO_ACK + MACRO_DISPATCHED, 0x0FE6: FILE_TIME_RESP})
+@pytest.mark.parametrize(
+    "report",
+    [
+        level_report(0x3D, body_tail=LEVEL_REPORT_RESERVED[:-1]),  # 10-byte body
+        level_report(0x3D, body_tail=LEVEL_REPORT_RESERVED + b"\x00"),  # 12-byte body
+        level_report(0x3D, mute=2),  # mute is 0 or 1
+    ],
+    ids=["short_body", "long_body", "mute_value"],
+)
+async def test_macro_action_rejects_malformed_level_report(serve, report):
+    fake = FakeController({0x07DA: MACRO_ACK + ACTION_START + report + ACTION_END + MACRO_DONE})
     async with ControlClient("127.0.0.1", await serve(fake), timeout=1) as client:
-        assert await client.macro_action(0) is None
-        await client.get_file_time()
-    assert fake.connections == [[MACRO_REQ], [FILE_TIME_REQ]]
+        with pytest.raises(MalformedFrameError):
+            await client.macro_action(0)
+
+
+@pytest.mark.parametrize(
+    ("frame", "error"),
+    [
+        (bytes.fromhex("00 03 00 fe ff 01"), ActionRejectedError),  # generic negative mid-sequence
+        (bytes.fromhex("00 04 00 dd 07 02 01"), ActionRejectedError),  # status other than 0x01
+        (bytes.fromhex("00 03 00 ee 07 01"), ProtocolError),  # opcode not in the sequence
+        (MACRO_ACK, ProtocolError),  # a second 0x07DB
+    ],
+    ids=["generic_negative", "failure_status", "unexpected_opcode", "second_ack"],
+)
+async def test_macro_action_rejects_unexpected_intermediate_frame(serve, frame, error):
+    fake = FakeController({0x07DA: MACRO_ACK + ACTION_START + frame + ACTION_END + MACRO_DONE})
+    async with ControlClient("127.0.0.1", await serve(fake), timeout=1) as client:
+        with pytest.raises(error):
+            await client.macro_action(0)
 
 
 async def test_macro_action_sends_prefix_then_trigger_code(serve):
@@ -247,7 +328,7 @@ async def test_wrong_length_volume_request_is_rejected(serve):
     fake = FakeController({0x07ED: WRONG_LENGTH_VOLUME_RESP})
     async with ControlClient("127.0.0.1", await serve(fake), timeout=1) as client:
         with pytest.raises(ActionRejectedError):
-            await client.request(0x07ED, WRONG_LENGTH_VOLUME_REQ[5:], Opcode.ACTION_AVR_SET_DRAG_VOLUME_REPLY)
+            await client.request(0x07ED, WRONG_LENGTH_VOLUME_REQ[5:], Opcode.SET_LEVEL_ABSOLUTE_REPLY)
     assert fake.requests == [WRONG_LENGTH_VOLUME_REQ]
 
 
@@ -328,7 +409,7 @@ async def test_generic_negative_on_action_raises_rejection(serve):
 
 
 async def test_terminal_query_sequence_reconnects(serve):
-    # Spec §52 §5.6: GET_FILE_TIME after GET_NET_STATUS needs a new connection.
+    # Spec §52 §5.6: CONTROLLER_TIME_QUERY after NETWORK_STATUS_QUERY needs a new connection.
     fake = FakeController({0x0FE1: NET_STATUS_RESP, 0x0FE6: FILE_TIME_RESP})
     async with ControlClient("127.0.0.1", await serve(fake), timeout=1) as client:
         assert await client.get_net_status()
@@ -352,7 +433,7 @@ async def test_file_time_leaves_connection_reusable(serve):
         await client.get_variables()
         await client.house_off()
         await client.house_off()
-    # Only GET_FILE_TIME is reusable; house off is treated as terminal (spec §52 §4 rules 4-5).
+    # Only CONTROLLER_TIME_QUERY is reusable; house off is treated as terminal (spec §52 §4 rules 4-5).
     assert fake.connections == [[FILE_TIME_REQ, FILE_TIME_REQ, VARIABLES_REQ], [HOUSE_OFF_REQ], [HOUSE_OFF_REQ]]
 
 
