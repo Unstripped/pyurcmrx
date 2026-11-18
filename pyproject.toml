@@ -1,6 +1,6 @@
 [project]
 name = "pyurcmrx"
-version = "0.1.0"
+version = "0.2.0"
 description = "Async LAN client for URC Total Control MRX controllers (clean-room, built from open-control-spec)"
 readme = "README.md"
 license = "MIT"
